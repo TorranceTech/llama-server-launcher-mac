@@ -89,11 +89,17 @@ from modules import ui_theme
 # Import the ik_llama configuration tab module
 from modules.ik_llama import IkLlamaTab
 
+# Import the MTP / Speculative Decoding tab module
+from modules.spec_tab import SpecTab
+
 # Import the launch functionality module
 from modules.launch import LaunchManager
 
 # Import the configuration management module
 from modules.config import ConfigManager
+
+# Import spec persistence helpers (re-sync block extracted to spec_persistence)
+from modules.spec_persistence import resync_spec_tk_vars_from_app_settings
 
 # Import system helper functions
 from modules.system import (
@@ -106,6 +112,59 @@ from modules.system import (
 # Defined here as a static method, needs to be called using the class name or self
 class LlamaCppLauncher:
     """Tk‑based launcher for llama.cpp HTTP server."""
+
+    # Names that live on ``self.spec_tab`` and are reassigned inside SpecTab
+    # methods (e.g. ``setup_tab`` reassigns ``spec_draft_gpu_vars = []`` after
+    # rebuilding the checkbox grid; analysis callbacks rebind
+    # ``current_spec_draft_analysis``). A static setattr re-export at
+    # construction would leave the launcher pointing at a stale reference, so
+    # __getattr__ delegates these lookups to the live SpecTab attribute
+    # instead. Tk var objects are NOT in this set — they're aliased at
+    # construction (see _SPEC_TAB_VAR_REEXPORT in __init__) because Tk vars
+    # are mutated via .set()/.get() and the reference is stable.
+    _SPEC_TAB_DELEGATED_ATTRS = frozenset({
+        # Reassigned-in-flight state.
+        "spec_draft_gpu_vars",
+        "current_spec_draft_analysis",
+        # Widget refs + hint/status vars created lazily inside SpecTab.setup_tab.
+        # The static re-export in __init__ runs BEFORE setup_tab so these would
+        # be missing at construction time; delegating via __getattr__ lets
+        # external callers read the live SpecTab attribute once setup_tab has
+        # populated it.
+        "spec_status_var",
+        "spec_pmin_hint_var",
+        "spec_psplit_hint_var",
+        "spec_parallel_hint_var",
+        "spec_draft_path_display_var",
+        "spec_draft_listbox",
+        "spec_draft_ngl_entry",
+        "spec_draft_ngl_slider",
+        "spec_draft_layers_status_label",
+        "spec_draft_gpu_checkbox_frame",
+        "spec_draft_ctk_combo",
+        "spec_draft_ctv_combo",
+    })
+
+    # Class-level aliases for the SpecTab per-backend whitelists so legacy
+    # tests like ``LlamaCppLauncher._SPEC_TYPES_LLAMA_CPP`` keep working.
+    # SpecTab owns the canonical definitions; these just re-export them at
+    # the launcher class level for backward compat.
+    _SPEC_TYPES_LLAMA_CPP = SpecTab._SPEC_TYPES_LLAMA_CPP
+    _SPEC_TYPES_IK_LLAMA = SpecTab._SPEC_TYPES_IK_LLAMA
+
+    def __getattr__(self, name):
+        """Fall back to ``self.spec_tab.<name>`` for SpecTab-owned attributes
+        that get rebound by SpecTab methods. Only called when normal lookup
+        fails (i.e. the attribute isn't on the launcher itself), so this
+        adds zero overhead for the common case.
+        """
+        if name in type(self)._SPEC_TAB_DELEGATED_ATTRS:
+            spec_tab = self.__dict__.get("spec_tab")
+            if spec_tab is not None:
+                return getattr(spec_tab, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
     # Define the cleanup static method first
     @staticmethod
@@ -150,6 +209,24 @@ class LlamaCppLauncher:
         self.root.title("LLaMa.cpp Server Launcher")
         self.root.geometry("900x1000")
         self.root.minsize(800, 750)
+
+        # Worker-thread lifecycle flag: background detection / version-check
+        # threads consult this Event before touching any Tk API on
+        # ``self.root``. We clear it the instant the root is destroyed
+        # (via WM_DELETE_WINDOW protocol and a <Destroy> binding) so any
+        # late-completing worker becomes a no-op rather than racing into a
+        # dead Tcl interpreter and corrupting the next launcher's UI
+        # threading state. See ``_safe_after_destroy`` / ``_mark_tk_dead``.
+        import threading as _threading_local
+        self._tk_alive = _threading_local.Event()
+        self._tk_alive.set()
+        try:
+            # Tk fires <Destroy> on the root widget before tearing down its
+            # interpreter, so we get a deterministic moment to flip the flag
+            # even when callers bypass ``on_exit`` (e.g. test fixtures).
+            self.root.bind("<Destroy>", self._on_root_destroy_event, add="+")
+        except Exception:  # pragma: no cover - defensive
+            pass
 
         # ------------------------------------------------ Internal Data Attributes --
         # Attributes that hold data not directly tied to Tk variables, often
@@ -198,6 +275,54 @@ class LlamaCppLauncher:
             "ui_theme_name":       "",
             "ui_font_family":      "",
             "ui_font_size":        0,
+            # MTP / Speculative decoding defaults. Master off, no type.
+            "spec_enabled":        False,
+            "spec_type":           "none",
+            "spec_draft_n_max":    "",
+            "spec_draft_n_min":    "",
+            "spec_draft_p_min":    "",
+            "spec_draft_p_split":  "",
+            "spec_draft_model":    "",
+            "spec_use_draft_model": False,
+            "spec_draft_ngl":      "",
+            "spec_draft_device":   "",
+            "spec_draft_ctk":      "",
+            "spec_draft_ctv":      "",
+            "spec_draft_cpu_moe":  False,
+            "spec_draft_n_cpu_moe":"",
+            # Indices (relative to detected CUDA devices) of GPUs selected for
+            # the draft/MTP model. Drives the new draft GPU checkbox grid and
+            # is converted to a "CUDA0,CUDA1,..." string in spec_draft_device.
+            "spec_draft_selected_gpus": [],
+            "spec_ngram_simple_size_n":   "",
+            "spec_ngram_simple_size_m":   "",
+            "spec_ngram_simple_min_hits": "",
+            "spec_ngram_mapk_size_n":     "",
+            "spec_ngram_mapk_size_m":     "",
+            "spec_ngram_mapk_min_hits":   "",
+            "spec_ngram_mapk4v_size_n":   "",
+            "spec_ngram_mapk4v_size_m":   "",
+            "spec_ngram_mapk4v_min_hits": "",
+            "spec_ngram_mod_n_min":       "",
+            "spec_ngram_mod_n_max":       "",
+            "spec_ngram_mod_n_match":     "",
+            "spec_ngram_size_n":          "",
+            "spec_ngram_size_m":          "",
+            "spec_ngram_min_hits":        "",
+            "spec_suffix_pattern_len":    "",
+            "spec_suffix_max_depth":      "",
+            "spec_autotune":              False,
+            "spec_draft_params":          "",
+            "no_mmproj":                  False,
+            # Reasoning / Thinking defaults (both backends). Empty = "don't emit".
+            "reasoning_mode":             "",
+            "reasoning_format":           "",
+            "reasoning_budget":           "",
+            "reasoning_budget_message":   "",
+            "chat_template_kwargs":       "",
+            # KV unification + cache-idle-slots (llama.cpp only). Empty = "don't emit".
+            "kv_unified_mode":            "",
+            "cache_idle_slots_mode":      "",
         }
         # List to store custom parameters entered by the user (strings)
         self.custom_parameters_list = [] # <-- New attribute for custom parameters
@@ -364,6 +489,92 @@ class LlamaCppLauncher:
         self.mmproj_selector_var = tk.StringVar(value="")
         self.mmproj_status_var = tk.StringVar(value="")
 
+        # --- MTP / Speculative Decoding ---
+        # All spec_*/no_mmproj Tk vars + derived UI state live on the SpecTab
+        # instance; the launcher exposes them as attributes via a re-export
+        # block further down so existing call sites (modules/launch.py,
+        # modules/config.py, tests) keep working unchanged. SpecTab also owns
+        # the _SPEC_TYPES_* class constants and the spec UI / handler methods.
+        # Instantiation MUST happen after backend_selection and parallel are
+        # created (above), since SpecTab.__init__ aliases them. The instance
+        # itself is bound below to ``self.spec_tab`` after all dependent vars
+        # exist.
+
+        # --- Reasoning / Thinking (both backends) ---
+        # Blank string for any of these means "don't emit the flag". The combobox
+        # values are whitelisted in launch.py before emission. These remain on
+        # the launcher (not SpecTab) because they live on the Chat Template tab
+        # not the MTP/Spec tab; spec_launch.emit_reasoning_args reads them via
+        # ``launcher.<name>`` exactly as before.
+        def _spec_init_bool(key):
+            v = self.app_settings.get(key, False)
+            return bool(v) if isinstance(v, bool) else (str(v).lower() in ("1", "true", "yes"))
+        def _spec_init_str(key, default=""):
+            v = self.app_settings.get(key, default)
+            return v if isinstance(v, str) else (str(v) if v is not None else default)
+
+        self.reasoning_mode             = tk.StringVar(value=_spec_init_str("reasoning_mode"))            # "", "on", "off", "auto"
+        self.reasoning_format           = tk.StringVar(value=_spec_init_str("reasoning_format"))          # "", "none", "deepseek", "deepseek-legacy", "auto"
+        self.reasoning_budget           = tk.StringVar(value=_spec_init_str("reasoning_budget"))          # integer string; "" = don't emit
+        self.reasoning_budget_message   = tk.StringVar(value=_spec_init_str("reasoning_budget_message"))
+        self.chat_template_kwargs       = tk.StringVar(value=_spec_init_str("chat_template_kwargs"))      # advanced JSON string
+
+        # --- KV Unification + cache-idle-slots (llama.cpp only) ---
+        # "" = don't emit, "on" -> --kv-unified / --cache-idle-slots,
+        # "off" -> --no-kv-unified / --no-cache-idle-slots.
+        self.kv_unified_mode            = tk.StringVar(value=_spec_init_str("kv_unified_mode"))
+        self.cache_idle_slots_mode      = tk.StringVar(value=_spec_init_str("cache_idle_slots_mode"))
+
+        # --- Instantiate SpecTab and re-expose its Tk vars + handler methods ---
+        # SpecTab owns all spec_*/no_mmproj Tk vars + the _SPEC_TYPES_*
+        # constants. We mirror its attributes onto the launcher itself so
+        # ``launcher.spec_enabled.get()`` (etc.) still works from
+        # modules/launch.py, modules/config.py, and tests without any
+        # downstream churn. This is the same pattern as IkLlamaTab/SettingsTab,
+        # but the re-export makes the spec_*/no_mmproj vars look "flat" on the
+        # launcher exactly like before the refactor.
+        self.spec_tab = SpecTab(self)
+        # Re-export the Tk var objects via a fixed list. Tk vars are never
+        # reassigned (only ``.set()`` / ``.get()``), so a one-time setattr is
+        # safe — the alias on the launcher and the original on ``spec_tab``
+        # share the same underlying object. For dict/list state that *is*
+        # reassigned inside SpecTab.setup_tab and the draft-analysis flow
+        # (``_spec_widgets``, ``_spec_sections``, ``spec_draft_gpu_vars``,
+        # ``current_spec_draft_analysis``), see ``__getattr__`` below — those
+        # are delegated lazily so callers always see the live mapping.
+        _SPEC_TAB_VAR_REEXPORT = (
+            "spec_enabled", "spec_type",
+            "spec_draft_n_max", "spec_draft_n_min", "spec_draft_p_min", "spec_draft_p_split",
+            "spec_draft_model", "spec_use_draft_model", "spec_draft_ngl", "spec_draft_device",
+            "spec_draft_ctk", "spec_draft_ctv", "spec_draft_cpu_moe", "spec_draft_n_cpu_moe",
+            "spec_draft_ngl_int", "max_spec_draft_gpu_layers", "spec_draft_layers_status_var",
+            "spec_ngram_simple_size_n", "spec_ngram_simple_size_m", "spec_ngram_simple_min_hits",
+            "spec_ngram_mapk_size_n", "spec_ngram_mapk_size_m", "spec_ngram_mapk_min_hits",
+            "spec_ngram_mapk4v_size_n", "spec_ngram_mapk4v_size_m", "spec_ngram_mapk4v_min_hits",
+            "spec_ngram_mod_n_min", "spec_ngram_mod_n_max", "spec_ngram_mod_n_match",
+            "spec_ngram_size_n", "spec_ngram_size_m", "spec_ngram_min_hits",
+            "spec_suffix_pattern_len", "spec_suffix_max_depth",
+            "spec_autotune", "spec_draft_params", "no_mmproj",
+            "_spec_widgets", "_spec_sections",
+        )
+        for _name in _SPEC_TAB_VAR_REEXPORT:
+            setattr(self, _name, getattr(self.spec_tab, _name))
+        _SPEC_TAB_METHOD_REEXPORT = (
+            "_apply_spec_defaults_if_blank", "_apply_mtp_parallel_default",
+            "_reset_spec_defaults", "_on_spec_enabled_changed", "_on_spec_type_changed",
+            "_refresh_spec_tab_state", "_on_spec_draft_model_selected",
+            "_clear_spec_draft_model", "_set_spec_draft_gpu_layers",
+            "_sync_spec_draft_gpu_layers_from_slider",
+            "_sync_spec_draft_gpu_layers_from_entry",
+            "_validate_spec_draft_gpu_layers_entry",
+            "_update_spec_draft_gpu_checkboxes",
+            "_on_spec_draft_gpu_selection_changed",
+            "_run_spec_draft_gguf_analysis",
+            "_update_ui_after_spec_draft_analysis",
+        )
+        for _name in _SPEC_TAB_METHOD_REEXPORT:
+            setattr(self, _name, getattr(self.spec_tab, _name))
+
         # --- Fit Parameters (memory fitting) ---
         self.fit_enabled     = tk.BooleanVar(value=True)   # --fit on/off (default: on)
         self.fit_ctx         = tk.StringVar(value="2048")  # --fit-ctx (synced with ctx_size by default)
@@ -483,6 +694,18 @@ class LlamaCppLauncher:
         # Load backend selection
         self.backend_selection.set(self.app_settings.get("backend_selection", "llama.cpp"))
 
+        # Re-sync spec/reasoning/kvu Tk vars from the just-loaded app_settings.
+        # Order-of-init bug: the Tk vars on the SpecTab and the launcher are
+        # initialized from ``self.app_settings`` BEFORE ``_load_saved_configs``
+        # updates it from disk. Without this re-sync the Tk vars keep their
+        # constructor defaults, AND the very next ``_save_configs()`` (triggered
+        # by traces fired during ``env_vars_manager`` / ``ik_llama_tab``
+        # load_from_config below) mirrors those defaults back into app_settings,
+        # silently wiping the disk values. Same issue affects
+        # ``selected_mmproj_path`` / ``mmproj_enabled``.
+        # See modules/spec_persistence.resync_spec_tk_vars_from_app_settings.
+        resync_spec_tk_vars_from_app_settings(self)
+
         # Load environmental variables configuration
         self.env_vars_manager.load_from_config(self.app_settings)
 
@@ -576,6 +799,13 @@ class LlamaCppLauncher:
         # Trace on custom entry variable to update the displayed template string (only when in custom mode)
         self.custom_template_string.trace_add("write", lambda *args: self._update_effective_template_display())
 
+        # --- MTP / Spec traces: refresh visibility/enabled state when relevant vars change.
+        # Both also pre-fill draft-tuning defaults (n-max / p-min / p-split) when the
+        # current spec_type benefits from them and the user hasn't typed values.
+        self.spec_enabled.trace_add("write", lambda *a: self._on_spec_enabled_changed())
+        self.spec_type.trace_add("write", lambda *a: self._on_spec_type_changed())
+        self.spec_use_draft_model.trace_add("write", lambda *a: self._refresh_spec_tab_state())
+
 
         # Populate model directories listbox
         self._update_model_dirs_listbox()
@@ -630,11 +860,14 @@ class LlamaCppLauncher:
         # Store notebook reference for tab visibility management
         self.notebook = nb
 
-        main_frame = ttk.Frame(nb); adv_frame = ttk.Frame(nb); cfg_frame = ttk.Frame(nb); chat_frame = ttk.Frame(nb); env_frame = ttk.Frame(nb); ik_llama_frame = ttk.Frame(nb); settings_frame = ttk.Frame(nb); about_frame = ttk.Frame(nb)
+        main_frame = ttk.Frame(nb); adv_frame = ttk.Frame(nb); cfg_frame = ttk.Frame(nb); chat_frame = ttk.Frame(nb); env_frame = ttk.Frame(nb); mtp_spec_frame = ttk.Frame(nb); ik_llama_frame = ttk.Frame(nb); settings_frame = ttk.Frame(nb); about_frame = ttk.Frame(nb)
         nb.add(main_frame, text="Main Settings")
         nb.add(adv_frame,  text="Advanced Settings")
         nb.add(chat_frame, text="Chat Template") # Add the new tab
         nb.add(env_frame,  text="Environment Variables") # Add environmental variables tab
+        # MTP / Speculative decoding tab - always visible (both backends support spec).
+        nb.add(mtp_spec_frame, text="MTP / Spec")
+        self.mtp_spec_frame = mtp_spec_frame
         # ik_llama tab will be added conditionally
         self.ik_llama_frame = ik_llama_frame
         nb.add(cfg_frame,  text="Configurations")
@@ -646,6 +879,7 @@ class LlamaCppLauncher:
         self._setup_advanced_tab(adv_frame)
         self._setup_chat_template_tab(chat_frame) # Setup the new tab
         self._setup_env_vars_tab(env_frame) # Setup the environmental variables tab
+        self._setup_mtp_spec_tab(mtp_spec_frame) # Setup the MTP / Spec tab
         self._setup_ik_llama_tab(ik_llama_frame) # Setup the ik_llama tab
         self._setup_config_tab(cfg_frame)
         self._setup_settings_tab(settings_frame) # UI settings tab
@@ -653,6 +887,35 @@ class LlamaCppLauncher:
 
         # Update ik_llama tab visibility based on current backend selection
         self._update_ik_llama_tab_visibility()
+        # Initial population of the draft GPU checkbox grid so it shows whatever
+        # device list we have at startup (typically the "Detecting..." state;
+        # real detection runs async and will re-trigger _update_gpu_checkboxes).
+        try:
+            self._update_spec_draft_gpu_checkboxes()
+        except Exception as exc:
+            print(
+                f"DEBUG: initial _update_spec_draft_gpu_checkboxes failed: {exc}",
+                file=sys.stderr,
+            )
+        # Initial refresh of MTP/Spec tab state based on current backend + type.
+        try:
+            self._refresh_spec_tab_state()
+        except Exception as exc:
+            print(f"DEBUG: initial _refresh_spec_tab_state failed: {exc}", file=sys.stderr)
+        # Apply the MTP parallel constraint on initial boot too. Without this,
+        # a saved config that ships with spec_enabled=True + draft-mtp/mtp
+        # AND parallel>1 would keep parallel>1 in the UI until the user
+        # toggled spec_enabled or spec_type. Emission would still force 1,
+        # but the UI would show a stale value.
+        try:
+            self._apply_mtp_parallel_default()
+        except Exception as exc:
+            print(f"DEBUG: initial _apply_mtp_parallel_default failed: {exc}", file=sys.stderr)
+        # Initial refresh of KV-unification combobox gating.
+        try:
+            self._refresh_kv_unify_state()
+        except Exception as exc:
+            print(f"DEBUG: initial _refresh_kv_unify_state failed: {exc}", file=sys.stderr)
 
         bar = ttk.Frame(self.root); bar.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(bar, text="Launch Server",   command=self.launch_manager.launch_server).pack(side="left",  padx=5)
@@ -1317,6 +1580,39 @@ class LlamaCppLauncher:
         ttk.Label(inner, text="Keep KV cache in CPU RAM even with GPU layers", font=("TkSmallCaptionFont"))\
             .grid(column=2, row=r-1, columnspan=2, sticky="w", padx=5, pady=3); # Re-grid label
 
+        # --- KV Cache Unification (llama.cpp only) ---
+        # Two tri-state comboboxes: "" = don't emit, "on"/"off" -> explicit flag.
+        # cache-idle-slots requires unified KV, so it's only enabled when kv_unified_mode == "on".
+        # Both are disabled entirely when backend == "ik_llama".
+        ttk.Label(inner, text="KV Cache Unification (llama.cpp only)", font=("TkDefaultFont", 11, "bold"))\
+            .grid(column=0, row=r, columnspan=4, sticky="w", padx=10, pady=(15, 3)); r += 1
+
+        ttk.Label(inner, text="Unified KV (--kv-unified):")\
+            .grid(column=0, row=r, sticky="w", padx=10, pady=3)
+        self.kv_unified_mode_combo = ttk.Combobox(inner, textvariable=self.kv_unified_mode,
+                                                  values=("", "on", "off"),
+                                                  state="readonly", width=8)
+        self.kv_unified_mode_combo.grid(column=1, row=r, sticky="w", padx=5, pady=3)
+        self.kv_unified_backend_label = ttk.Label(inner, text="", font=("TkSmallCaptionFont"), foreground="gray")
+        self.kv_unified_backend_label.grid(column=2, row=r, columnspan=2, sticky="w", padx=5, pady=3); r += 1
+        ttk.Label(inner, text="Blank = don't emit. 'on' enables --kv-unified; 'off' emits --no-kv-unified.", font=("TkSmallCaptionFont"))\
+            .grid(column=1, row=r, columnspan=3, sticky="w", padx=5, pady=(0, 3)); r += 1
+
+        ttk.Label(inner, text="Cache Idle Slots (--cache-idle-slots):")\
+            .grid(column=0, row=r, sticky="w", padx=10, pady=3)
+        self.cache_idle_slots_mode_combo = ttk.Combobox(inner, textvariable=self.cache_idle_slots_mode,
+                                                        values=("", "on", "off"),
+                                                        state="readonly", width=8)
+        self.cache_idle_slots_mode_combo.grid(column=1, row=r, sticky="w", padx=5, pady=3)
+        self.cache_idle_slots_warn_label = ttk.Label(inner, text="Requires --kv-unified to be 'on'.",
+                                                     font=("TkSmallCaptionFont"), foreground="gray")
+        self.cache_idle_slots_warn_label.grid(column=2, row=r, columnspan=2, sticky="w", padx=5, pady=3); r += 1
+
+        # Live state-gating: respond to both kv_unified_mode and backend_selection changes.
+        self.kv_unified_mode.trace_add("write", lambda *a: self._refresh_kv_unify_state())
+        # backend_selection already has a trace in __init__; _on_backend_selection_changed
+        # will call _refresh_kv_unify_state. Initial state is set after widgets exist.
+
 
         # --- Performance (Batching & Threading) ---
         ttk.Label(inner, text="Performance Settings", font=("TkDefaultFont", 12, "bold"))\
@@ -1565,6 +1861,75 @@ class LlamaCppLauncher:
              .grid(column=1, row=r, columnspan=2, sticky="w", padx=5, pady=(0,3)); r += 1
 
 
+        # --- Reasoning / Thinking section ---
+        # Supported by BOTH backends (llama.cpp mainline & ik_llama). No per-backend
+        # gating: every flag below is accepted by both binaries. Blank = "don't emit".
+        ttk.Separator(frame, orient='horizontal').grid(column=0, row=r, columnspan=3, sticky='ew', padx=5, pady=10); r += 1
+        ttk.Label(frame, text="Reasoning / Thinking", font=("TkDefaultFont", 12, "bold"))\
+            .grid(column=0, row=r, columnspan=3, sticky="w", padx=5, pady=(0, 5)); r += 1
+        ttk.Label(frame, text="Controls --reasoning / --reasoning-format / --reasoning-budget. Leave blank to emit nothing.", font=("TkSmallCaptionFont"))\
+            .grid(column=0, row=r, columnspan=3, sticky="w", padx=5, pady=(0, 5)); r += 1
+
+        # --reasoning {on,off,auto}
+        ttk.Label(frame, text="Reasoning Mode (--reasoning):")\
+            .grid(column=0, row=r, sticky="w", padx=5, pady=3)
+        self.reasoning_mode_combo = ttk.Combobox(frame, textvariable=self.reasoning_mode,
+                                                 values=("", "auto", "on", "off"),
+                                                 state="readonly", width=15)
+        self.reasoning_mode_combo.grid(column=1, row=r, sticky="w", padx=5, pady=3)
+        ttk.Label(frame, text="Blank = don't emit. 'auto' is server default.", font=("TkSmallCaptionFont"))\
+            .grid(column=2, row=r, sticky="w", padx=5, pady=3); r += 1
+
+        # --reasoning-format
+        ttk.Label(frame, text="Reasoning Format (--reasoning-format):")\
+            .grid(column=0, row=r, sticky="w", padx=5, pady=3)
+        # state="normal" so users can type a custom value not in the dropdown.
+        self.reasoning_format_combo = ttk.Combobox(frame, textvariable=self.reasoning_format,
+                                                   values=("", "auto", "none", "deepseek", "deepseek-legacy"),
+                                                   state="normal", width=20)
+        self.reasoning_format_combo.grid(column=1, row=r, sticky="w", padx=5, pady=3)
+        ttk.Label(frame, text="Server default: auto.", font=("TkSmallCaptionFont"))\
+            .grid(column=2, row=r, sticky="w", padx=5, pady=3); r += 1
+
+        # --reasoning-budget
+        ttk.Label(frame, text="Reasoning Budget (--reasoning-budget):")\
+            .grid(column=0, row=r, sticky="w", padx=5, pady=3)
+        # Restrict typed input to optional sign + digits so a stray "abc" can't
+        # be saved into the config and crash the server at launch time.
+        vcmd = (self.root.register(self._validate_int_or_blank), "%P")
+        self.reasoning_budget_entry = ttk.Entry(frame, textvariable=self.reasoning_budget, width=15,
+                                                validate="key", validatecommand=vcmd)
+        self.reasoning_budget_entry.grid(column=1, row=r, sticky="w", padx=5, pady=3)
+        # Normalize a final bare '-' to blank on focus-out: the validator
+        # allows it during typing (so users can type "-1") but a lone '-'
+        # is not a valid integer and would otherwise persist into the
+        # config and be silently dropped at emission.
+        self.reasoning_budget_entry.bind(
+            "<FocusOut>",
+            lambda _e: self._normalize_reasoning_budget_on_focus_out(),
+        )
+        ttk.Label(frame, text="Integer. -1 = unlimited (default), 0 = end immediately, N > 0 = token budget.", font=("TkSmallCaptionFont"))\
+            .grid(column=2, row=r, sticky="w", padx=5, pady=3); r += 1
+
+        # --reasoning-budget-message
+        ttk.Label(frame, text="Reasoning Budget Message (--reasoning-budget-message):")\
+            .grid(column=0, row=r, sticky="w", padx=5, pady=3)
+        self.reasoning_budget_message_entry = ttk.Entry(frame, textvariable=self.reasoning_budget_message)
+        self.reasoning_budget_message_entry.grid(column=1, row=r, sticky="ew", padx=5, pady=3, columnspan=2); r += 1
+
+        # --chat-template-kwargs
+        ttk.Label(frame, text="Chat Template KWargs (--chat-template-kwargs):")\
+            .grid(column=0, row=r, sticky="w", padx=5, pady=3)
+        self.chat_template_kwargs_entry = ttk.Entry(frame, textvariable=self.chat_template_kwargs)
+        self.chat_template_kwargs_entry.grid(column=1, row=r, sticky="ew", padx=5, pady=3, columnspan=2); r += 1
+        ttk.Label(frame, text="(advanced: JSON string)", font=("TkSmallCaptionFont"), foreground="gray")\
+            .grid(column=1, row=r, columnspan=2, sticky="w", padx=5, pady=(0, 3)); r += 1
+        ttk.Label(frame,
+                  text="Use --reasoning on/off instead of --chat-template-kwargs '{\"preserve_thinking\":true}'",
+                  font=("TkSmallCaptionFont"), foreground="gray")\
+            .grid(column=1, row=r, columnspan=2, sticky="w", padx=5, pady=(0, 3)); r += 1
+
+
         # Initial state update based on self.template_source (called in __init__)
 
 
@@ -1758,6 +2123,16 @@ class LlamaCppLauncher:
         """Set up the ik_llama configuration tab using the IkLlamaTab class."""
         # Create the ik_llama tab using the dedicated class
         self.ik_llama_tab.create_tab(parent)
+
+    # ░░░░░ MTP / SPECULATIVE DECODING TAB ░░░░░
+    # Backend-aware tab; class lives in modules/spec_tab.py. The launcher
+    # owns ``self.spec_tab`` and re-exposes its Tk vars + handler methods via
+    # the re-export block in ``__init__`` (Tk vars) and ``__getattr__``
+    # delegation for the few attributes SpecTab rebinds (see
+    # ``_SPEC_TAB_DELEGATED_ATTRS``).
+    def _setup_mtp_spec_tab(self, parent):
+        """Set up the MTP / Speculative Decoding tab (thin delegator to SpecTab.setup_tab)."""
+        self.spec_tab.setup_tab(parent)
 
     def _setup_settings_tab(self, parent):
         """Set up the Settings (UI appearance) tab."""
@@ -2023,6 +2398,50 @@ class LlamaCppLauncher:
         for name in model_names:
             self.model_listbox.insert(tk.END, name)
         self.root.update_idletasks()
+
+        # Mirror the population into the MTP/Spec tab's draft-model listbox so
+        # the user can pick the draft GGUF from the same pool. State is
+        # forced to NORMAL while inserting; _refresh_spec_tab_state() at the
+        # end restores the per-backend/per-spec_type enable/disable rules.
+        if hasattr(self, "spec_draft_listbox") and self.spec_draft_listbox.winfo_exists():
+            self.spec_draft_listbox.config(state=tk.NORMAL)
+            self.spec_draft_listbox.delete(0, tk.END)
+            for name in model_names:
+                self.spec_draft_listbox.insert(tk.END, name)
+            # Restore the user's prior draft selection if its path still exists.
+            saved_draft = (self.spec_draft_model.get() or "").strip()
+            restored_draft_selection = False
+            if saved_draft:
+                try:
+                    saved_path = Path(saved_draft).resolve()
+                    for idx, display_name in enumerate(model_names):
+                        full_path = self.found_models.get(display_name)
+                        if full_path is not None and full_path == saved_path:
+                            self.spec_draft_listbox.selection_clear(0, tk.END)
+                            self.spec_draft_listbox.selection_set(idx)
+                            self.spec_draft_listbox.see(idx)
+                            restored_draft_selection = True
+                            break
+                except (ValueError, OSError):
+                    pass
+            # Keep the path display label in sync with the (possibly cleared)
+            # stored draft model value.
+            if hasattr(self, "spec_draft_path_display_var"):
+                cur = (self.spec_draft_model.get() or "").strip()
+                self.spec_draft_path_display_var.set(cur or "(none — uses base GGUF for MTP)")
+            # ``selection_set`` does not fire the ``<<ListboxSelect>>``
+            # binding, so the draft-layer analysis / slider state / status
+            # label would otherwise stay stale until the user clicked the
+            # item. Call the handler directly to repopulate them now.
+            if restored_draft_selection:
+                try:
+                    self._on_spec_draft_model_selected()
+                except Exception as exc:
+                    print(f"DEBUG: restored draft selection handler failed: {exc}", file=sys.stderr)
+            try:
+                self._refresh_spec_tab_state()
+            except Exception:
+                pass
 
         # Re-enable Add/Remove buttons after scan
         if hasattr(self, 'dir_btn_frame') and self.dir_btn_frame.winfo_exists():
@@ -2837,6 +3256,16 @@ class LlamaCppLauncher:
         self._update_gpu_order_listbox()
         self._update_recommendations()
 
+        # Refresh the draft GPU checkbox grid in lockstep so newly-detected (or
+        # removed) GPUs propagate to the MTP/Spec tab without a full restart.
+        try:
+            self._update_spec_draft_gpu_checkboxes()
+        except Exception as exc:
+            print(
+                f"WARN: _update_spec_draft_gpu_checkboxes from _update_gpu_checkboxes failed: {exc}",
+                file=sys.stderr,
+            )
+
     def _refresh_vram_display(self):
         """Helper method to refresh VRAM display if it exists."""
         if hasattr(self, '_vram_info_frame'):
@@ -3377,7 +3806,98 @@ class LlamaCppLauncher:
         self.app_settings["backend_selection"] = selected_backend
         self._update_root_directory_labels()  # Update the labels
         self._update_ik_llama_tab_visibility()  # Update ik_llama tab visibility
+        # Refresh the MTP/Spec tab so backend-specific knobs/values track the active backend.
+        try:
+            self._refresh_spec_tab_state()
+        except Exception as exc:
+            print(f"DEBUG: _refresh_spec_tab_state failed in _on_backend_selection_changed: {exc}", file=sys.stderr)
+        # Refresh the KV-unification combobox gating (disabled on ik_llama).
+        try:
+            self._refresh_kv_unify_state()
+        except Exception as exc:
+            print(f"DEBUG: _refresh_kv_unify_state failed in _on_backend_selection_changed: {exc}", file=sys.stderr)
         self._save_configs()
+
+    @staticmethod
+    def _validate_int_or_blank(proposed):
+        """Tk validatecommand: allow empty, a bare '-', or a signed integer."""
+        if proposed in ("", "-"):
+            return True
+        try:
+            int(proposed)
+            return True
+        except ValueError:
+            return False
+
+    def _normalize_reasoning_budget_on_focus_out(self):
+        """FocusOut handler for the reasoning_budget Entry.
+
+        The validator allows a bare ``-`` mid-typing (so users can type
+        ``-1``) but a lone ``-`` is not a valid integer and would otherwise
+        persist into the config and be silently dropped at emission. On
+        focus-out, normalize a bare ``-`` back to ``""``.
+        """
+        try:
+            if self.reasoning_budget.get().strip() == "-":
+                self.reasoning_budget.set("")
+        except Exception:
+            pass
+
+    def _refresh_kv_unify_state(self, *args):
+        """Enable/disable the kv-unified and cache-idle-slots combos.
+
+        ik_llama: both disabled (binary doesn't accept these flags).
+        llama.cpp: kv-unified is always enabled; cache-idle-slots is enabled
+                   only when kv-unified is "on".
+        """
+        try:
+            backend = self.backend_selection.get()
+        except Exception:
+            backend = "llama.cpp"
+
+        # Both widgets may not exist yet during __init__ ordering.
+        kvu_combo = getattr(self, "kv_unified_mode_combo", None)
+        cis_combo = getattr(self, "cache_idle_slots_mode_combo", None)
+        backend_label = getattr(self, "kv_unified_backend_label", None)
+        warn_label = getattr(self, "cache_idle_slots_warn_label", None)
+
+        if backend == "ik_llama":
+            # Disable both, show the "not supported" note next to kv-unified.
+            if kvu_combo is not None and kvu_combo.winfo_exists():
+                kvu_combo.config(state=tk.DISABLED)
+            if cis_combo is not None and cis_combo.winfo_exists():
+                cis_combo.config(state=tk.DISABLED)
+            if backend_label is not None and backend_label.winfo_exists():
+                backend_label.config(text="(not supported by ik_llama)")
+            if warn_label is not None and warn_label.winfo_exists():
+                warn_label.config(text="(not supported by ik_llama)")
+        else:
+            # llama.cpp: kv-unified always available; cache-idle-slots depends on it.
+            if kvu_combo is not None and kvu_combo.winfo_exists():
+                kvu_combo.config(state="readonly")
+            if backend_label is not None and backend_label.winfo_exists():
+                backend_label.config(text="")
+            if cis_combo is not None and cis_combo.winfo_exists():
+                try:
+                    kvu_val = self.kv_unified_mode.get().strip()
+                except Exception:
+                    kvu_val = ""
+                if kvu_val == "on":
+                    cis_combo.config(state="readonly")
+                    if warn_label is not None and warn_label.winfo_exists():
+                        warn_label.config(text="Requires --kv-unified to be 'on'.")
+                else:
+                    cis_combo.config(state=tk.DISABLED)
+                    # Clear stale value so the launcher doesn't emit
+                    # --cache-idle-slots without --kv-unified (server warns
+                    # and disables it anyway, producing log noise).
+                    try:
+                        if self.cache_idle_slots_mode.get().strip():
+                            self.cache_idle_slots_mode.set("")
+                    except Exception:
+                        pass
+                    if warn_label is not None and warn_label.winfo_exists():
+                        warn_label.config(text="Requires --kv-unified to be 'on'.")
 
     def _update_ik_llama_tab_visibility(self):
         """Show or hide the ik_llama tab based on backend selection."""
@@ -3438,6 +3958,11 @@ class LlamaCppLauncher:
     # ═════════════════════════════════════════════════════════════════
     # Fixed structure: method definition is outside other methods
     def on_exit(self):
+        # Tell background workers to stop dispatching back to Tk *before*
+        # we begin destroying the root. ``_save_configs`` itself doesn't
+        # need the flag, but a worker that wakes up during the save+destroy
+        # window would otherwise race into a half-torn-down interpreter.
+        self._mark_tk_dead()
         try:
             self._save_configs()
         except Exception as e:
@@ -3491,7 +4016,17 @@ class LlamaCppLauncher:
     # ═════════════════════════════════════════════════════════════════
 
     def _start_system_info_detection(self):
-        """Start system info detection in a background thread."""
+        """Start system info detection in a background thread.
+
+        Reads the venv path on the *main* thread before forking — touching
+        a ``tk.StringVar`` from a worker thread after the root has been
+        destroyed (e.g. during pytest teardown between UI cases) raises
+        ``RuntimeError: main thread is not in main loop`` and corrupts
+        Tcl's threading state on Python 3.13, which then deadlocks the
+        next ``ttk.Notebook.add()``. The worker only consumes the captured
+        string and dispatches Tk-mutating work back through ``.after(...)``
+        wrapped in ``_safe_after_destroy``.
+        """
         # Prevent multiple simultaneous detection threads
         if hasattr(self, '_detection_in_progress') and self._detection_in_progress:
             debug_print("GPU detection already in progress, skipping new request")
@@ -3499,16 +4034,29 @@ class LlamaCppLauncher:
 
         self._detection_in_progress = True
 
-        def detect_system_info():
+        # Pre-read all Tk vars the worker would otherwise touch — done here
+        # on the main thread so a late-completing worker can't reach back
+        # into a destroyed interpreter.
+        try:
+            captured_venv_path = self.venv_dir.get().strip() or None
+        except (tk.TclError, RuntimeError):
+            captured_venv_path = None
+
+        def detect_system_info(venv_path=captured_venv_path):
             """Background thread function to detect system info."""
             try:
                 print("DEBUG: Starting background system info detection...", file=sys.stderr)
-                # Perform the potentially slow system info detection
-                self.system_info_manager.fetch_system_info()
+                # ``defer_tk_writes=True`` keeps the worker from touching
+                # Tcl: it only populates plain-Python attributes. The
+                # completion callback (main thread) applies Tk vars
+                # afterwards via ``_apply_system_info_to_tk_vars``.
+                self.system_info_manager.fetch_system_info(
+                    venv_path=venv_path, defer_tk_writes=True
+                )
                 print("DEBUG: Background system info detection completed.", file=sys.stderr)
 
                 # Schedule UI update on main thread (flag will be cleared there)
-                self.root.after(0, self._on_system_info_detection_complete)
+                self._safe_after_destroy(0, self._on_system_info_detection_complete)
             except Exception as e:
                 print(f"ERROR: System info detection failed: {e}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
@@ -3517,7 +4065,7 @@ class LlamaCppLauncher:
                 # callback later on the main thread — so a naive ``lambda:
                 # ... error=str(e)`` raises NameError at callback time.
                 error_message = str(e)
-                self.root.after(
+                self._safe_after_destroy(
                     0,
                     lambda: self._on_system_info_detection_complete(error=error_message),
                 )
@@ -3526,11 +4074,68 @@ class LlamaCppLauncher:
         detection_thread = Thread(target=detect_system_info, daemon=True)
         detection_thread.start()
 
+    def _safe_after_destroy(self, delay, callback):
+        """``self.root.after(delay, callback)`` that swallows post-destroy
+        races. Background threads that complete after the launcher root
+        has been destroyed (common during test teardown) would otherwise
+        raise ``RuntimeError: main thread is not in main loop`` from deep
+        inside Tcl, and on Python 3.13 that error corrupts the global
+        interpreter state and deadlocks the next root's UI calls.
+
+        Uses a Python-level ``threading.Event`` flag (``_tk_alive``) so
+        the check itself never touches Tcl from the worker thread —
+        ``root.winfo_exists()`` would raise ``RuntimeError`` from a
+        non-main thread on Python 3.13 and the raise itself wedges the
+        global Tcl interpreter, blocking any subsequent ``ttk`` call on
+        the next root. The flag is cleared in ``_mark_tk_dead`` which
+        every teardown path (on_exit, root.destroy via Tk's WM_DELETE
+        protocol, test fixtures) must call.
+        """
+        if not getattr(self, "_tk_alive", None) or not self._tk_alive.is_set():
+            return
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        try:
+            root.after(delay, callback)
+        except (tk.TclError, RuntimeError):
+            # Final fence: even with the Python flag, the root could
+            # have been destroyed between the flag check and the call.
+            pass
+
+    def _mark_tk_dead(self):
+        """Clear the ``_tk_alive`` flag so worker threads stop dispatching
+        Tk callbacks. Idempotent; safe to call from any thread.
+        """
+        flag = getattr(self, "_tk_alive", None)
+        if flag is not None:
+            flag.clear()
+
+    def _on_root_destroy_event(self, event):
+        """``<Destroy>`` handler on ``self.root``. Tk fires this once per
+        widget under the root; we only care about the root itself, so we
+        compare ``event.widget`` to ``self.root``. Flipping the
+        ``_tk_alive`` flag here guarantees that workers see the dead-root
+        state even when teardown bypassed ``on_exit`` (test fixtures call
+        ``root.destroy()`` directly).
+        """
+        try:
+            if event.widget is self.root:
+                self._mark_tk_dead()
+        except Exception:
+            pass
+
     def _on_system_info_detection_complete(self, error=None):
         """Handle completion of system info detection (runs on main thread)."""
         try:
             # Clear detection flag (single point of clearing)
             self._detection_in_progress = False
+
+            # Apply the system-info Tk vars on the main thread — the worker
+            # populated plain-Python attributes only (defer_tk_writes=True),
+            # so we mirror them into Tk now that we're back on the GIL/Tcl
+            # main thread. Bail out if the root has been destroyed under us.
+            self._apply_system_info_to_tk_vars()
 
             if error:
                 self._handle_detection_error(error)
@@ -3547,6 +4152,38 @@ class LlamaCppLauncher:
         except Exception as e:
             print(f"ERROR: Failed to update UI after system info detection: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+
+    def _apply_system_info_to_tk_vars(self):
+        """Mirror the worker-populated system-info attributes into their
+        Tk var counterparts. Always called on the main thread by
+        ``_on_system_info_detection_complete``. Wrapped in try/except so
+        a destroyed-root race during teardown is a no-op.
+        """
+        if not self._tk_alive.is_set():
+            return
+        try:
+            physical = getattr(self, "physical_cores", 2)
+            logical = getattr(self, "logical_cores", 4)
+            gpu_msg = ""
+            if (not self.gpu_info.get("available")
+                    and self.gpu_info.get("message")):
+                gpu_msg = self.gpu_info["message"]
+            for var_name, value in (
+                ("threads", str(physical)),
+                ("threads_batch", str(logical)),
+                ("recommended_threads_var",
+                 f"Recommended: {physical} (Your CPU physical cores)"),
+                ("recommended_threads_batch_var",
+                 f"Recommended: {logical} (Your CPU logical cores)"),
+                ("gpu_detected_status_var", gpu_msg),
+            ):
+                try:
+                    getattr(self, var_name).set(value)
+                except (tk.TclError, RuntimeError):
+                    pass
+        except Exception as e:
+            print(f"WARN: _apply_system_info_to_tk_vars failed: {e}",
+                  file=sys.stderr)
 
     def _handle_detection_error(self, error):
         """Handle GPU detection error state."""

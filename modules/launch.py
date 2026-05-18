@@ -18,6 +18,22 @@ from pathlib import Path
 from tkinter import messagebox, filedialog
 from threading import Thread
 
+from modules.spec_launch import (
+    emit_spec_args,
+    emit_main_device_arg,
+    emit_reasoning_args,
+    emit_kv_unify_args,
+    emit_no_mmproj_arg,
+    resolve_effective_parallel,
+    get_effective_visible_gpu_indices,
+    # Re-exports for backward compat with tests that import the per-backend
+    # spec-type whitelists from modules.launch (they moved to spec_launch).
+    _ALLOWED_SPEC_TYPES_LLAMA_CPP,
+    _ALLOWED_SPEC_TYPES_IK_LLAMA,
+    _DRAFT_CAPABLE_SPEC_TYPES_LLAMA_CPP,
+    _DRAFT_CAPABLE_SPEC_TYPES_IK_LLAMA,
+)
+
 
 class LaunchManager:
     """Manages command building and server launching functionality."""
@@ -256,7 +272,27 @@ class LaunchManager:
         cmd.extend(["-m", final_model_path])
 
         # --- Append mmproj if enabled and exists ---
-        if self.launcher.mmproj_enabled.get():
+        # Mutual exclusion with --no-mmproj: when the user has explicitly
+        # asked to suppress the projector (and we're on a backend that
+        # supports the flag), skip mmproj auto-detection entirely so we
+        # don't emit a contradictory ``--mmproj <path> --no-mmproj`` pair.
+        no_mmproj_set = False
+        try:
+            no_mmproj_var = getattr(self.launcher, "no_mmproj", None)
+            no_mmproj_set = bool(
+                no_mmproj_var is not None
+                and no_mmproj_var.get()
+                and backend != "ik_llama"
+            )
+        except Exception:
+            no_mmproj_set = False
+        if no_mmproj_set and self.launcher.mmproj_enabled.get():
+            print(
+                "INFO: --no-mmproj is set; skipping --mmproj auto-detection to "
+                "avoid a contradictory flag pair.",
+                file=sys.stderr,
+            )
+        if self.launcher.mmproj_enabled.get() and not no_mmproj_set:
             try:
                 mmproj_file = None
                 selected_mmproj_str = self.launcher.selected_mmproj_path.get().strip() if hasattr(self.launcher, "selected_mmproj_path") else ""
@@ -291,6 +327,24 @@ class LaunchManager:
                     print(f"DEBUG: Adding --mmproj {mmproj_file.name}", file=sys.stderr)
             except Exception as e:
                 print(f"WARNING: Error scanning for mmproj files: {e}", file=sys.stderr)
+
+        # --- Speculative Decoding / Reasoning / KV Unification / --no-mmproj ---
+        # All four emission blocks live in modules/spec_launch.py. They read
+        # the launcher's spec_*/reasoning_*/kv_unified_*/no_mmproj Tk vars and
+        # append to cmd in place. Behavior is unchanged from the prior inline
+        # blocks; see spec_launch.py for the per-backend gating rationale.
+        emit_spec_args(self.launcher, backend, cmd)
+        # Pair to --spec-draft-device: when draft GPUs were unioned into
+        # CUDA_VISIBLE_DEVICES, the MAIN model also needs --device CUDA<i>
+        # so the binary doesn't spread main layers onto the draft targets
+        # and OOM the draft model. Skipped when --tensor-split is set
+        # (precedence) and in manual GPU mode. See spec_launch.py for the
+        # full rationale.
+        emit_main_device_arg(self.launcher, backend, cmd)
+        emit_reasoning_args(self.launcher, cmd)
+        emit_kv_unify_args(self.launcher, backend, cmd)
+        emit_no_mmproj_arg(self.launcher, backend, cmd)
+
 
         # --- Other Arguments ---
         # --- KV Cache Type ---
@@ -392,7 +446,12 @@ class LaunchManager:
 
         # Performance options
         self.add_arg(cmd, "--prio", self.launcher.prio.get(), "0") # Omit if 0 (default)
-        self.add_arg(cmd, "--parallel", self.launcher.parallel.get(), "1") # Omit if 1 (default)
+
+        # MTP enforces single-slot operation (-np 1). resolve_effective_parallel
+        # applies the override + stderr warning when MTP is active; see
+        # modules/spec_launch.py for rationale.
+        parallel_val = resolve_effective_parallel(self.launcher, backend)
+        self.add_arg(cmd, "--parallel", parallel_val, "1") # Omit if 1 (default)
 
         # --- MoE CPU options ---
         self.add_arg(cmd, "--cpu-moe", self.launcher.cpu_moe.get()) # Omit if False (default)
@@ -452,21 +511,47 @@ class LaunchManager:
         # but are NOT using --tensor-split (which explicitly lists devices/split).
         # This warning is helpful because llama.cpp might use all GPUs by default unless restricted by env var or tensor-split.
         ordered_selected_gpus = self.launcher.get_ordered_selected_gpus()
+        # The exported CUDA_VISIBLE_DEVICES value is the EFFECTIVE list (main
+        # ∪ draft) — the same list ``_resolve_cuda_visible_devices_action``
+        # uses. Show that to the user, plus a draft-spillover hint when the
+        # union added GPUs the main selection didn't include. The old
+        # "Specific GPUs (1,7)" log was misleading when draft GPUs got
+        # union'd in and the env var became "1,2,5,7".
+        effective_gpus = get_effective_visible_gpu_indices(self.launcher)
         detected_gpu_count = self.launcher.gpu_info.get("device_count", 0)
-        selected_indices_str = ",".join(map(str, ordered_selected_gpus))
+        effective_indices_str = ",".join(map(str, effective_gpus))
+        draft_only_gpus = [g for g in effective_gpus if g not in set(ordered_selected_gpus)]
+        # In manual GPU mode the launcher script intentionally UNSETS
+        # CUDA_VISIBLE_DEVICES (synthetic indices have no relation to real
+        # PCIe devices), so this advisory's "the script will set
+        # CUDA_VISIBLE_DEVICES=..." claim becomes a lie. Skip it entirely.
+        cuda_action, _cuda_val = self._resolve_cuda_visible_devices_action()
+        cuda_export_active = (cuda_action == "export")
 
-        # Only warn if GPUs were detected, the user selected a *subset*, and --tensor-split is not used.
-        if detected_gpu_count > 0 and len(ordered_selected_gpus) > 0 and len(ordered_selected_gpus) < detected_gpu_count and not tensor_split_val:
+        # Only warn if GPUs were detected, the user selected a *subset*, --tensor-split is not used,
+        # AND the resolver will actually export CUDA_VISIBLE_DEVICES (skips manual mode).
+        if cuda_export_active and detected_gpu_count > 0 and len(effective_gpus) > 0 and len(effective_gpus) < detected_gpu_count and not tensor_split_val:
              # Only warn if the user explicitly selected a *subset* of GPUs using the checkboxes AND didn't use tensor-split
-             print(f"\nINFO: Specific GPUs ({selected_indices_str}) were selected via checkboxes, but --tensor-split was not used.", file=sys.stderr)
+             print(f"\nINFO: Specific GPUs ({effective_indices_str}) were selected via checkboxes, but --tensor-split was not used.", file=sys.stderr)
              # The PowerShell script will set CUDA_VISIBLE_DEVICES, so the warning applies more generally now.
              print("      llama-server might default to using all available GPUs unless restricted by CUDA_VISIBLE_DEVICES environment variable.", file=sys.stderr)
+             if draft_only_gpus:
+                  # Draft GPUs unioned into the visible set: warn the user
+                  # that the main model can spill onto them unless they
+                  # constrain it via --tensor-split. This is the explicit
+                  # tradeoff of Option C (auto-union + advisory).
+                  print(
+                      f"      INFO: GPUs {draft_only_gpus} were added to CUDA_VISIBLE_DEVICES for the draft model. "
+                      f"Without --tensor-split the main model can spill onto them; "
+                      f"set --tensor-split to keep the main model on {ordered_selected_gpus}.",
+                      file=sys.stderr,
+                  )
              if sys.platform != "win32":
                   # Only print the bash/export example on Linux/macOS if needed
-                  print(f"      To restrict server to GPUs {selected_indices_str}, set CUDA_VISIBLE_DEVICES={selected_indices_str} environment variable *before* launching (e.g., 'export CUDA_VISIBLE_DEVICES={selected_indices_str}' on Linux/macOS bash).", file=sys.stderr)
+                  print(f"      To restrict server to GPUs {effective_indices_str}, set CUDA_VISIBLE_DEVICES={effective_indices_str} environment variable *before* launching (e.g., 'export CUDA_VISIBLE_DEVICES={effective_indices_str}' on Linux/macOS bash).", file=sys.stderr)
              else:
                  # On Windows, the script *will* set it if GPUs are selected, but reinforce
-                  print(f"      The generated PowerShell script will set CUDA_VISIBLE_DEVICES={selected_indices_str}.", file=sys.stderr)
+                  print(f"      The generated PowerShell script will set CUDA_VISIBLE_DEVICES={effective_indices_str}.", file=sys.stderr)
 
              print("      Alternatively, use --tensor-split to explicitly assign layers.", file=sys.stderr)
         elif len(ordered_selected_gpus) > 0 and detected_gpu_count > 0:
@@ -678,6 +763,15 @@ class LaunchManager:
         (``0..N-1`` against the user's planning list) and have no relation to
         physical PCIe bus IDs. Passing them through would filter the wrong
         real devices on a CUDA-enabled host.
+
+        Spec-decoding draft-GPU union: when speculative decoding is enabled
+        with a draft-capable spec_type AND the user selected draft GPUs not
+        already in the main selection, those GPUs are unioned into the
+        exported value via ``get_effective_visible_gpu_indices``. Without
+        the union, the binary's ``CUDA_VISIBLE_DEVICES`` filter would hide
+        the draft-only GPUs, causing the draft model to fall back onto
+        CUDA0 (= the first main GPU) and OOM against the already-loaded
+        main model. See the module-level comment in ``spec_launch.py``.
         """
         is_manual_mode = self.launcher.gpu_info.get("manual_mode", False)
         device_count = self.launcher.gpu_info.get("device_count", 0)
@@ -687,9 +781,9 @@ class LaunchManager:
             # shell value doesn't silently filter real hardware.
             return ("unset", None)
 
-        ordered_gpus = self.launcher.get_ordered_selected_gpus()
-        if ordered_gpus:
-            return ("export", ",".join(map(str, ordered_gpus)))
+        effective_gpus = get_effective_visible_gpu_indices(self.launcher)
+        if effective_gpus:
+            return ("export", ",".join(map(str, effective_gpus)))
 
         if device_count > 0:
             # Real GPUs detected but user deselected all of them.

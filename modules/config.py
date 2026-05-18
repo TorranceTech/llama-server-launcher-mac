@@ -8,6 +8,14 @@ from pathlib import Path
 from tkinter import messagebox, filedialog
 from datetime import datetime
 
+from modules.spec_persistence import (
+    collect_spec_into_cfg,
+    load_spec_from_cfg,
+    validate_spec_app_settings,
+    sync_spec_to_app_settings,
+    coerce_spec_draft_selected_gpus,
+)
+
 
 class ConfigManager:
     """Configuration management for LLaMa.cpp Server Launcher."""
@@ -303,6 +311,9 @@ class ConfigManager:
             "parallel":      self.launcher.parallel.get(),
             # --- Multi-modal Projection ---
             "mmproj_enabled": self.launcher.mmproj_enabled.get(),
+            # --- MTP / Speculative Decoding + Reasoning + KV Unification ---
+            # All spec/reasoning/kvu keys are mirrored by collect_spec_into_cfg
+            # below (after the dict literal); see modules/spec_persistence.py.
             # --- Fit Parameters ---
             "fit_enabled": self.launcher.fit_enabled.get(),
             "fit_ctx": self.launcher.fit_ctx.get(),
@@ -319,11 +330,24 @@ class ConfigManager:
             "custom_parameters": self.launcher.custom_parameters_list, # Save the list of strings
         }
 
+        # Mirror every spec/reasoning/kvu Tk var into the cfg dict. Lives in
+        # modules/spec_persistence.py so the named-config save/load and the
+        # app_settings save/load all share one source of truth for keys.
+        collect_spec_into_cfg(self.launcher, cfg)
+
         # Include selected_gpus directly in the config dictionary for easier loading from config tab
         # This is redundant with app_settings, but keeps config self-contained for this tab.
         cfg["gpu_indices"] = self.launcher.app_settings.get("selected_gpus", [])
         # Save GPU order (determines CUDA_VISIBLE_DEVICES order and tensor split assignment)
         cfg["gpu_order"] = self.launcher.app_settings.get("gpu_order", [])
+        # Mirror the draft-GPU checkbox indices into the per-config dict so
+        # named-config save/load reinstates the visual checkbox state, not
+        # just the comma-joined ``spec_draft_device`` string. Same pattern as
+        # ``gpu_indices`` above — redundant with app_settings but keeps the
+        # named-config self-contained.
+        cfg["spec_draft_selected_gpus"] = list(
+            self.launcher.app_settings.get("spec_draft_selected_gpus", []) or []
+        )
 
         # Add environmental variables configuration
         cfg.update(self.launcher.env_vars_manager.save_to_config())
@@ -388,6 +412,9 @@ class ConfigManager:
         # --- Multi-modal Projection ---
         self.launcher.mmproj_enabled.set(cfg.get("mmproj_enabled", False))
         self.launcher.selected_mmproj_path.set(cfg.get("selected_mmproj_path", ""))
+        # --- MTP / Speculative Decoding + Reasoning + KV Unification ---
+        # All set() calls live in modules/spec_persistence.load_spec_from_cfg.
+        load_spec_from_cfg(self.launcher, cfg)
         # --- Fit Parameters ---
         self.launcher.fit_enabled.set(cfg.get("fit_enabled", True))  # Default: True (on)
         self.launcher.fit_ctx_synced = cfg.get("fit_ctx_synced", True)  # Default: synced
@@ -446,8 +473,24 @@ class ConfigManager:
                 loaded_gpu_order.append(g)
         self.launcher.app_settings["gpu_order"] = loaded_gpu_order
 
+        # Load draft-GPU checkbox indices the same way. Fall back to the
+        # current app_settings value (which itself round-trips via
+        # save_configs/load_saved_configs) so an older named-config without
+        # this key keeps the previously-saved checkbox state.
+        loaded_draft_gpus = cfg.get(
+            "spec_draft_selected_gpus",
+            self.launcher.app_settings.get("spec_draft_selected_gpus", []),
+        )
+        # Coerce defensively — same shape as the load_saved_configs validation.
+        self.launcher.app_settings["spec_draft_selected_gpus"] = (
+            coerce_spec_draft_selected_gpus(loaded_draft_gpus)
+        )
+
         self.launcher._update_gpu_checkboxes() # This will set the checkboxes according to self.launcher.app_settings["selected_gpus"]
         # _update_gpu_checkboxes also triggers _update_recommendations and updates the GPU order listbox
+        # _update_gpu_checkboxes already cascades to
+        # _update_spec_draft_gpu_checkboxes at its tail, so the draft checkbox
+        # grid will be refreshed with the loaded indices. No second call needed.
 
 
         # Load n_gpu_layers - This interacts with model analysis results
@@ -848,6 +891,14 @@ class ConfigManager:
             # Ensure selected_gpus is a list
             if not isinstance(self.launcher.app_settings.get("selected_gpus"), list):
                  self.launcher.app_settings["selected_gpus"] = []
+            # Validate spec_draft_selected_gpus: must be a list of ints; coerce
+            # anything else to [] so legacy/garbage configs can't corrupt the
+            # checkbox grid.
+            self.launcher.app_settings["spec_draft_selected_gpus"] = (
+                coerce_spec_draft_selected_gpus(
+                    self.launcher.app_settings.get("spec_draft_selected_gpus", [])
+                )
+            )
             # Ensure custom_parameters is a list
             if not isinstance(self.launcher.app_settings.get("custom_parameters"), list):
                  self.launcher.app_settings["custom_parameters"] = []
@@ -874,9 +925,19 @@ class ConfigManager:
             # ui_scaling was removed — strip any leftover key so old configs don't carry it forward
             self.launcher.app_settings.pop("ui_scaling", None)
 
+            # Validate MTP / Speculative Decoding entries so legacy/missing
+            # entries don't break later set() calls. Mutates app_settings
+            # in place; see modules/spec_persistence.validate_spec_app_settings.
+            validate_spec_app_settings(self.launcher.app_settings)
+
             # Filter selected_gpus to only include indices of currently detected GPUs
             valid_gpu_indices = {gpu['id'] for gpu in self.launcher.detected_gpu_devices}
             self.launcher.app_settings["selected_gpus"] = [idx for idx in self.launcher.app_settings["selected_gpus"] if idx in valid_gpu_indices]
+            # Same filter for the draft GPU selection.
+            self.launcher.app_settings["spec_draft_selected_gpus"] = [
+                idx for idx in self.launcher.app_settings.get("spec_draft_selected_gpus", [])
+                if idx in valid_gpu_indices
+            ]
             # Filter gpu_order the same way and append any newly-selected GPUs that were missing
             selected_set = set(self.launcher.app_settings["selected_gpus"])
             gpu_order = [idx for idx in self.launcher.app_settings.get("gpu_order", []) if idx in selected_set]
@@ -984,6 +1045,11 @@ class ConfigManager:
         self.launcher.app_settings["manual_model_mode"] = self.launcher.manual_model_mode.get()
         self.launcher.app_settings["manual_model_layers"] = self.launcher.manual_model_layers.get()
         self.launcher.app_settings["manual_model_size_gb"] = self.launcher.manual_model_size_gb.get()
+
+        # Mirror MTP / Speculative Decoding settings into app_settings so they
+        # round-trip independently of named-config save/load (matches the
+        # selected_mmproj_path pattern). See modules/spec_persistence.py.
+        sync_spec_to_app_settings(self.launcher)
 
         # Save ik_llama settings to app_settings
         ik_llama_settings = self.launcher.ik_llama_tab.save_to_config()

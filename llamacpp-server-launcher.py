@@ -661,11 +661,15 @@ class LlamaCppLauncher:
         self.recommended_threads_var.set(f"Recommended: {self.physical_cores} (Detecting...)")
         self.recommended_threads_batch_var.set(f"Recommended: {self.logical_cores} (Detecting...)")
         # Set initial GPU availability status
+        import platform as _platform
+        _is_apple = sys.platform == "darwin" and _platform.machine() == "arm64"
         initial_gpu_count = self.gpu_info.get("device_count", 0)
         if self.gpu_info.get("metal", False):
             self.gpu_availability_var.set("Metal GPU (Apple Silicon):")
         elif self.gpu_info.get('available', False) and initial_gpu_count > 0:
             self.gpu_availability_var.set(f"CUDA Devices ({initial_gpu_count} available):")
+        elif _is_apple:
+            self.gpu_availability_var.set("Metal GPU (Detecting...)")
         else:
             self.gpu_availability_var.set("CUDA Devices (Detecting...)")
         # Display initial GPU detection status message
@@ -2341,7 +2345,10 @@ class LlamaCppLauncher:
             try:
                 # Collect GGUF model files with case-insensitive matching, including *.gguf.partXofY.
                 for gguf_path in model_dir.rglob('*'):
-                    if not gguf_path.is_file():
+                    try:
+                        if not gguf_path.is_file():
+                            continue
+                    except (PermissionError, OSError):
                         continue
                     filename_l = gguf_path.name.lower()
                     if not re.search(r"\.gguf(?:\.part\d+of\d+)?$", filename_l):
@@ -2350,6 +2357,8 @@ class LlamaCppLauncher:
                     if "mmproj" in filename_l or filename_l.endswith(".bin.gguf"):
                         continue
                     all_gguf_files.append(gguf_path)
+            except (PermissionError, OSError) as e:
+                print(f"DEBUG: Permission error scanning {model_dir}: {e}", file=sys.stderr)
             except Exception as e:
                 print(f"ERROR: Error scanning directory {model_dir}: {e}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)

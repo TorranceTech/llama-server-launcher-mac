@@ -215,6 +215,7 @@ class AboutTab:
         self.github_version_url = "https://raw.githubusercontent.com/TorranceTech/llama-server-launcher-mac/main/config/version"
         self.donate_url = "https://www.paypal.com/paypalme/torrancetech"
         self.upstream_url = "https://github.com/thad0ctor/llama-server-launcher"
+        self.upstream_donate_url = "https://www.paypal.me/thad0ctor"
         self.version_status = "Checking..."
         self.remote_version = None
         self.version_label = None
@@ -603,10 +604,19 @@ class AboutTab:
         donate_frame = ttk.Frame(support_frame)
         donate_frame.pack(fill="x", pady=(0, 5))
 
-        ttk.Label(donate_frame, text="Support TorranceTech (PayPal):").pack(side="left")
+        ttk.Label(donate_frame, text="Support TorranceTech (Mac fork):").pack(side="left")
         donate_button = ttk.Button(donate_frame, text="💝 Donate",
                                   command=lambda: self._open_url(self.donate_url))
         donate_button.pack(side="right")
+
+        # Donate button — thad0ctor (original creator)
+        upstream_donate_frame = ttk.Frame(support_frame)
+        upstream_donate_frame.pack(fill="x", pady=(0, 5))
+
+        ttk.Label(upstream_donate_frame, text="Support thad0ctor (original creator):").pack(side="left")
+        upstream_donate_button = ttk.Button(upstream_donate_frame, text="💝 Donate",
+                                            command=lambda: self._open_url(self.upstream_donate_url))
+        upstream_donate_button.pack(side="right")
         
         # Credits section
         credits_frame = ttk.LabelFrame(content_frame, text="Credits", padding=15)

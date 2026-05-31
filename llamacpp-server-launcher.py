@@ -933,7 +933,9 @@ class LlamaCppLauncher:
         inner.bind("<Configure>", lambda e: canvas.configure(yscrollcommand=vs.set,
                                                              scrollregion=canvas.bbox("all")))
         canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+        def _sync_width_main(e, _c=canvas, _cw=canvas_window):
+            _c.after_idle(lambda: _c.itemconfig(_cw, width=_c.winfo_width()))
+        canvas.bind("<Configure>", _sync_width_main)
         canvas.pack(side="left", fill="both", expand=True); vs.pack(side="right", fill="y")
 
         inner.columnconfigure(1, weight=1) # Make model path entry expand
@@ -1273,7 +1275,9 @@ class LlamaCppLauncher:
         inner.bind("<Configure>", lambda e: canvas.configure(yscrollcommand=vs.set,
                                                              scrollregion=canvas.bbox("all")))
         canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+        def _sync_width_adv(e, _c=canvas, _cw=canvas_window):
+            _c.after_idle(lambda: _c.itemconfig(_cw, width=_c.winfo_width()))
+        canvas.bind("<Configure>", _sync_width_adv)
         canvas.pack(side="left", fill="both", expand=True); vs.pack(side="right", fill="y")
 
         inner.columnconfigure(1, weight=1) # Make relevant columns expandable
@@ -2077,7 +2081,9 @@ class LlamaCppLauncher:
         inner.bind("<Configure>", lambda e: canvas.configure(yscrollcommand=vs.set,
                                                              scrollregion=canvas.bbox("all")))
         canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+        def _sync_width_cfg(e, _c=canvas, _cw=canvas_window):
+            _c.after_idle(lambda: _c.itemconfig(_cw, width=_c.winfo_width()))
+        canvas.bind("<Configure>", _sync_width_cfg)
         canvas.pack(side="left", fill="both", expand=True); vs.pack(side="right", fill="y")
 
         # Configuration Management

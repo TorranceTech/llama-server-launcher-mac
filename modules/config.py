@@ -798,6 +798,25 @@ class ConfigManager:
 
     def get_config_path(self):
         """Get the configuration file path, with fallback handling."""
+        # When running from a PyInstaller bundle, the bundle dir is read-only
+        # on reinstall and gets wiped on update. Always use the user config dir.
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            user_dir = Path.home() / ".config" / "llama_cpp_launcher"
+            user_dir.mkdir(parents=True, exist_ok=True)
+            user_config = user_dir / "configs.json"
+            # Seed with bundled defaults (correct model_dirs) on first launch
+            if not user_config.exists():
+                bundled = Path(sys._MEIPASS) / "config" / "llama_cpp_launcher_configs.json"
+                if bundled.exists():
+                    try:
+                        import shutil as _sh
+                        _sh.copy2(bundled, user_config)
+                        print(f"INFO: Seeded user config from bundle: {user_config}", file=sys.stderr)
+                    except OSError as _e:
+                        print(f"WARNING: Could not seed user config: {_e}", file=sys.stderr)
+            print(f"DEBUG: Using bundle user config: {user_config}", file=sys.stderr)
+            return user_config
+
         repo_root = Path(__file__).parent.parent
         local_path = repo_root / "config" / "llama_cpp_launcher_configs.json" # Renamed slightly to avoid potential clashes
         legacy_path = repo_root / "llama_cpp_launcher_configs.json"

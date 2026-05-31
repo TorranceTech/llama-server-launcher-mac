@@ -361,8 +361,9 @@ class AboutTab:
         version_text = f"Version: {self.version} ({self.version_status})"
         if self.remote_version and self.version_status == "Update Available":
             version_text += f" - Latest: {self.remote_version}"
+        # Must dispatch to main thread — Tcl/Tk is not thread-safe
         try:
-            self.version_label.config(text=version_text)
+            self.version_label.after(0, lambda t=version_text: self.version_label.config(text=t))
         except (tk.TclError, RuntimeError):
             pass
 
@@ -370,8 +371,9 @@ class AboutTab:
         """Show the update button when an update is available."""
         if not self.update_button or not self._widget_alive():
             return
+        # Must dispatch to main thread — Tcl/Tk is not thread-safe
         try:
-            self.update_button.pack(pady=(10, 0))
+            self.update_button.after(0, lambda: self.update_button.pack(pady=(10, 0)))
         except (tk.TclError, RuntimeError):
             pass
     

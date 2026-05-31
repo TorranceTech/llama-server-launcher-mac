@@ -34,7 +34,7 @@ mkdir -p "$DMG_DIR"
 
 # ── Regenerate icon ───────────────────────────────────────────────────────────
 echo "==> Generating app icon..."
-ICON_SRC="$SCRIPT_DIR/images/main.png"
+ICON_SRC="$SCRIPT_DIR/images/app_icon_src.png"
 ICONSET="/tmp/AppIcon.iconset"
 ICNS_OUT="$SCRIPT_DIR/images/app_icon.icns"
 

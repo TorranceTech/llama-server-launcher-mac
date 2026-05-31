@@ -9,3 +9,11 @@ launchers/*.sh
 !launchers/.gitkeep
 /backup
 .coverage
+# macOS build artifacts
+build/
+dist/
+build-env/
+dmg_staging/
+*.dmg
+images/app_icon.icns
+.DS_Store

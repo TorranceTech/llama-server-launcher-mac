@@ -378,8 +378,8 @@ class SpecTab:
             orient="horizontal",
             variable=self.spec_draft_ngl_int,
             command=self._sync_spec_draft_gpu_layers_from_slider,
-            state=tk.DISABLED,
         )
+        self.spec_draft_ngl_slider.state(['disabled'])
         self.spec_draft_ngl_slider.grid(column=1, row=0, sticky="ew", padx=5)
 
         self.spec_draft_layers_status_label = ttk.Label(
@@ -601,7 +601,7 @@ class SpecTab:
                     hasattr(self, "spec_draft_ngl_slider")
                     and self.spec_draft_ngl_slider.winfo_exists()
                 ):
-                    self.spec_draft_ngl_slider.config(state=tk.DISABLED)
+                    self.spec_draft_ngl_slider.state(['disabled'])
                 self.current_spec_draft_analysis = {}
                 t = Thread(
                     target=self._run_spec_draft_gguf_analysis,
@@ -630,7 +630,8 @@ class SpecTab:
             self.max_spec_draft_gpu_layers.set(0)
             self.spec_draft_layers_status_var.set("Select draft model to see layer info")
             if hasattr(self, "spec_draft_ngl_slider") and self.spec_draft_ngl_slider.winfo_exists():
-                self.spec_draft_ngl_slider.config(to=0, state=tk.DISABLED)
+                self.spec_draft_ngl_slider.config(to=0)
+                self.spec_draft_ngl_slider.state(['disabled'])
         except (tk.TclError, AttributeError):
             pass
 
@@ -870,7 +871,8 @@ class SpecTab:
                 hasattr(self, "spec_draft_ngl_slider")
                 and self.spec_draft_ngl_slider.winfo_exists()
             ):
-                self.spec_draft_ngl_slider.config(to=0, state=tk.DISABLED)
+                self.spec_draft_ngl_slider.config(to=0)
+                self.spec_draft_ngl_slider.state(['disabled'])
             return
         # Success: enable slider and update status. Mirrors main +1 for output.
         max_offloadable = n_layers + 1
@@ -882,7 +884,8 @@ class SpecTab:
             hasattr(self, "spec_draft_ngl_slider")
             and self.spec_draft_ngl_slider.winfo_exists()
         ):
-            self.spec_draft_ngl_slider.config(to=max_offloadable, state=tk.NORMAL)
+            self.spec_draft_ngl_slider.config(to=max_offloadable)
+            self.spec_draft_ngl_slider.state(['!disabled'])
         # Re-sync entry -> int so the slider reflects the entry's current value.
         try:
             self._sync_spec_draft_gpu_layers_from_entry()

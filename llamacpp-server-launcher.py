@@ -662,7 +662,9 @@ class LlamaCppLauncher:
         self.recommended_threads_batch_var.set(f"Recommended: {self.logical_cores} (Detecting...)")
         # Set initial GPU availability status
         initial_gpu_count = self.gpu_info.get("device_count", 0)
-        if self.gpu_info.get('available', False) and initial_gpu_count > 0:
+        if self.gpu_info.get("metal", False):
+            self.gpu_availability_var.set("Metal GPU (Apple Silicon):")
+        elif self.gpu_info.get('available', False) and initial_gpu_count > 0:
             self.gpu_availability_var.set(f"CUDA Devices ({initial_gpu_count} available):")
         else:
             self.gpu_availability_var.set("CUDA Devices (Detecting...)")
@@ -1383,7 +1385,8 @@ class LlamaCppLauncher:
         # Slider is intentionally disabled initially
         self.gpu_layers_slider = ttk.Scale(gpu_layers_frame, from_=0, to=self.max_gpu_layers.get(),
                                            orient="horizontal", variable=self.n_gpu_layers_int,
-                                           command=self._sync_gpu_layers_from_slider, state=tk.DISABLED)
+                                           command=self._sync_gpu_layers_from_slider)
+        self.gpu_layers_slider.state(['disabled'])
         self.gpu_layers_slider.grid(column=1, row=0, sticky="ew", padx=5)
 
         self.gpu_layers_status_label = ttk.Label(gpu_layers_frame, textvariable=self.gpu_layers_status_var, width=35, anchor="w")
@@ -2675,7 +2678,7 @@ class LlamaCppLauncher:
 
             # Start GGUF analysis using built-in parser
             self.gpu_layers_status_var.set("Analyzing model...")
-            self.gpu_layers_slider.config(state=tk.DISABLED)
+            self.gpu_layers_slider.state(['disabled'])
             # Entry remains enabled, validated state will apply
             self._reset_model_info_display()  # Reset info fields before analysis starts
             self.current_model_analysis = {}  # Clear old analysis
@@ -2840,7 +2843,8 @@ class LlamaCppLauncher:
             self.max_gpu_layers.set(max_offloadable)
             self.gpu_layers_status_var.set(f"Max Layers: {max_offloadable} ({n_layers} blocks + output)")
             if hasattr(self, 'gpu_layers_slider') and self.gpu_layers_slider.winfo_exists():
-                self.gpu_layers_slider.config(to=max_offloadable, state=tk.NORMAL) # Enable slider
+                self.gpu_layers_slider.config(to=max_offloadable)
+                self.gpu_layers_slider.state(['!disabled'])  # Enable slider
 
             # If tensor split is not blank, set max layers to the maximum quantity instead of defaulting to 0
             tensor_split_val = self.tensor_split.get().strip()
@@ -2878,7 +2882,8 @@ class LlamaCppLauncher:
 
          # Slider range and state
          if hasattr(self, 'gpu_layers_slider') and self.gpu_layers_slider.winfo_exists():
-              self.gpu_layers_slider.config(to=0, state=tk.DISABLED) # Slider disabled if max_layers is 0
+              self.gpu_layers_slider.config(to=0)
+              self.gpu_layers_slider.state(['disabled'])  # Slider disabled if max_layers is 0
 
          # Set entry state based on keep_entry_enabled parameter
          if hasattr(self, 'n_gpu_layers_entry') and self.n_gpu_layers_entry.winfo_exists():
@@ -3083,7 +3088,8 @@ class LlamaCppLauncher:
         self.gpu_layers_status_var.set(f"Max Layers: {layers} (Manual)")
 
         if hasattr(self, 'gpu_layers_slider') and self.gpu_layers_slider.winfo_exists():
-            self.gpu_layers_slider.config(to=layers, state=tk.NORMAL)
+            self.gpu_layers_slider.config(to=layers)
+            self.gpu_layers_slider.state(['!disabled'])
 
         if hasattr(self, 'n_gpu_layers_entry') and self.n_gpu_layers_entry.winfo_exists():
             self.n_gpu_layers_entry.config(state=tk.NORMAL)
@@ -3299,16 +3305,25 @@ class LlamaCppLauncher:
 
         if self.gpu_info['available'] and self.gpu_info['device_count'] > 0:
             is_manual_mode = self.gpu_info.get("manual_mode", False)
-            vram_label_text = "VRAM (Total GB):" if not is_manual_mode else "VRAM (Manual Setup):"
+            is_metal = self.gpu_info.get("metal", False)
+            if is_metal:
+                vram_label_text = "Unified Memory:"
+            elif is_manual_mode:
+                vram_label_text = "VRAM (Manual Setup):"
+            else:
+                vram_label_text = "VRAM (Total GB):"
 
             ttk.Label(self._vram_info_frame, text=vram_label_text, font=("TkSmallCaptionFont", 8, ("bold",)))\
                 .pack(side="left", padx=(0, 5))
 
-            # Display VRAM for each detected GPU
+            # Display memory for each detected GPU/device
             for gpu in self.detected_gpu_devices:
-                 gpu_text = f"GPU {gpu['id']}: {gpu['total_memory_gb']:.2f} GB"
-                 if is_manual_mode:
-                     gpu_text += " (Manual)"
+                 if is_metal:
+                     gpu_text = f"{gpu['name']}: {gpu['total_memory_gb']:.2f} GB (shared RAM)"
+                 else:
+                     gpu_text = f"GPU {gpu['id']}: {gpu['total_memory_gb']:.2f} GB"
+                     if is_manual_mode:
+                         gpu_text += " (Manual)"
                  ttk.Label(self._vram_info_frame, text=gpu_text, font="TkSmallCaptionFont")\
                     .pack(side="left", padx=5)
 
@@ -3545,6 +3560,10 @@ class LlamaCppLauncher:
 
 
         # --- Tensor Split Recommendation (VRAM-based) ---
+        # Tensor split is a CUDA multi-GPU concept; skip entirely on Metal.
+        if self.gpu_info.get("metal", False):
+            return
+
         n_layers = self.current_model_analysis.get("n_layers")
         # Get the list of selected GPUs in user-specified order
         # This order determines CUDA_VISIBLE_DEVICES and thus which physical GPU is GPU 0, 1, etc.
@@ -4146,6 +4165,7 @@ class LlamaCppLauncher:
             self._update_gpu_checkboxes()
             self._refresh_vram_display()
             self._update_recommendations()
+            self._apply_metal_ui_state()
 
             print("DEBUG: UI update after system info detection completed.", file=sys.stderr)
 
@@ -4189,7 +4209,10 @@ class LlamaCppLauncher:
         """Handle GPU detection error state."""
         print(f"DEBUG: System info detection completed with error: {error}", file=sys.stderr)
         self.gpu_detected_status_var.set(f"GPU detection failed: {error}")
-        self.gpu_availability_var.set("CUDA Devices (Detection failed):")
+        is_metal = getattr(self, 'gpu_info', {}).get("metal", False)
+        self.gpu_availability_var.set(
+            "Metal GPU (Detection failed):" if is_metal else "CUDA Devices (Detection failed):"
+        )
         self.recommended_threads_var.set(f"Recommended: {self.physical_cores} (detection failed)")
         self.recommended_threads_batch_var.set(f"Recommended: {self.logical_cores} (detection failed)")
         self.cpu_logical_cores_display_var.set(f"{self.logical_cores} (detection failed)")
@@ -4223,15 +4246,75 @@ class LlamaCppLauncher:
 
     def _update_gpu_info(self):
         """Update GPU-related UI components after detection."""
+        is_metal = self.gpu_info.get("metal", False)
+
         # Update GPU detection status message
-        self.gpu_detected_status_var.set(self.gpu_info['message'] if not self.gpu_info['available'] and self.gpu_info.get('message') else "")
+        if is_metal:
+            self.gpu_detected_status_var.set("")
+        else:
+            self.gpu_detected_status_var.set(
+                self.gpu_info['message'] if not self.gpu_info['available'] and self.gpu_info.get('message') else ""
+            )
 
         # Update GPU availability display
         gpu_count = len(self.detected_gpu_devices)
-        if self.gpu_info['available'] and gpu_count > 0:
+        if is_metal:
+            self.gpu_availability_var.set("Metal GPU (Apple Silicon):")
+        elif self.gpu_info['available'] and gpu_count > 0:
             self.gpu_availability_var.set(f"CUDA Devices ({gpu_count} available):")
         else:
             self.gpu_availability_var.set("CUDA Devices (Not available):")
+
+    def _apply_metal_ui_state(self):
+        """Disable CUDA-only GPU controls when Apple Silicon Metal is detected.
+
+        Tensor split, GPU order reordering, and main-GPU index are CUDA
+        multi-device concepts. On Metal there is a single unified-memory
+        device so these controls serve no purpose and are disabled with a
+        tooltip-style label update explaining why.
+        """
+        is_metal = self.gpu_info.get("metal", False)
+        new_state = tk.DISABLED if is_metal else tk.NORMAL
+
+        # Tensor-split entry + Apply button
+        for widget_name in ("tensor_split_entry", "apply_tensor_split_btn"):
+            w = getattr(self, widget_name, None)
+            if w and w.winfo_exists():
+                try:
+                    w.configure(state=new_state)
+                except tk.TclError:
+                    pass
+
+        # Recommended tensor-split label
+        if is_metal:
+            self.recommended_tensor_split_var.set("N/A — not applicable on Apple Silicon (single unified-memory GPU)")
+        else:
+            # Will be recalculated by _update_recommendations; reset to neutral
+            if self.recommended_tensor_split_var.get().startswith("N/A — not applicable"):
+                self.recommended_tensor_split_var.set("N/A - Need >1 selected GPU & model layers")
+
+        # GPU order listbox + Up/Down buttons
+        for widget_name in ("gpu_order_listbox", "gpu_order_up_btn", "gpu_order_down_btn"):
+            w = getattr(self, widget_name, None)
+            if w and w.winfo_exists():
+                try:
+                    w.configure(state=new_state)
+                except tk.TclError:
+                    pass
+
+        # Main-GPU entry
+        w = getattr(self, "main_gpu_entry", None)
+        if w and w.winfo_exists():
+            try:
+                w.configure(state=new_state)
+            except tk.TclError:
+                pass
+
+        print(
+            f"DEBUG: _apply_metal_ui_state — metal={is_metal}, "
+            f"CUDA controls {'disabled' if is_metal else 'enabled'}",
+            file=sys.stderr,
+        )
 
     def _log_gpu_detection_results(self):
         """Log GPU detection results for debugging."""
@@ -4661,4 +4744,8 @@ if __name__ == "__main__":
     root = tk.Tk()
     app  = LlamaCppLauncher(root)
     root.protocol("WM_DELETE_WINDOW", app.on_exit)
+    # Force an initial render pass on macOS where the window can appear blank
+    # before the first user interaction with Tk 8.5.x / older AppKit.
+    root.update_idletasks()
+    root.update()
     root.mainloop()

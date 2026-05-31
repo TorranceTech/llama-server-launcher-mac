@@ -503,6 +503,23 @@ def _recolor_existing_tk_widgets(root, p):
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _aqua_is_broken(root):
+    """Return True if the 'aqua' theme should be avoided.
+
+    Tk 8.5.x on macOS uses an older AppKit bridge that causes blank/white
+    windows when combined with ttk.Notebook + embedded tk.Canvas widgets on
+    modern macOS (11+). Tk 8.6+ fixed this; skip 'aqua' on older builds.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        ver = root.tk.call("info", "patchlevel")   # e.g. "8.5.9"
+        major, minor = int(ver.split(".")[0]), int(ver.split(".")[1])
+        return (major, minor) < (8, 6)
+    except Exception:
+        return False
+
+
 def apply_theme(root, mode="auto", explicit_theme=None):
     """Apply a ttk theme chosen by mode, then push a palette over it.
 
@@ -520,6 +537,13 @@ def apply_theme(root, mode="auto", explicit_theme=None):
 
     if not available:
         return (None, False)
+
+    # On macOS with Tk < 8.6, the 'aqua' theme causes blank windows.
+    # Remove it from consideration so we fall back to 'clam'.
+    if _aqua_is_broken(root):
+        available = [t for t in available if t != "aqua"]
+        if not available:
+            return (None, False)
 
     # Remember the theme Tk had active before any of our overrides land — used
     # as the last-resort fallback for "auto" when OS dark-mode detection fails.
@@ -574,7 +598,10 @@ def apply_theme(root, mode="auto", explicit_theme=None):
         return (None, False)
 
     palette = _palette_for(chosen, effective_mode)
-    _apply_style_palette(root, style, palette)
+    # The native macOS 'aqua' theme uses AppKit rendering; forcing a custom
+    # colour palette on top of it breaks widget rendering on Python 3.9.
+    if chosen != "aqua":
+        _apply_style_palette(root, style, palette)
     is_dark = _is_dark_palette(palette)
     return (chosen, is_dark)
 

@@ -211,9 +211,10 @@ class AboutTab:
 
     def __init__(self):
         self.version = self._load_version()
-        self.github_url = "https://github.com/thad0ctor/llama-server-launcher"
-        self.github_version_url = "https://raw.githubusercontent.com/thad0ctor/llama-server-launcher/main/config/version"
-        self.donate_url = "https://www.paypal.me/thad0ctor"
+        self.github_url = "https://github.com/TorranceTech/llama-server-launcher-mac"
+        self.github_version_url = "https://raw.githubusercontent.com/TorranceTech/llama-server-launcher-mac/main/config/version"
+        self.donate_url = "https://www.paypal.com/paypalme/torrancetech"
+        self.upstream_url = "https://github.com/thad0ctor/llama-server-launcher"
         self.version_status = "Checking..."
         self.remote_version = None
         self.version_label = None
@@ -565,34 +566,45 @@ class AboutTab:
         
         # Description
         description = ("A user-friendly GUI to easily configure and launch the llama.cpp server, "
-                      "manage model configurations, set environment variables, and generate launch scripts.")
+                      "manage model configurations, set environment variables, and generate launch scripts.\n\n"
+                      "This is a modified version with Apple Silicon (Metal) support for Mac Studio M2/M3/M4.")
         desc_label = ttk.Label(project_frame, text=description, wraplength=400, justify="left")
         desc_label.pack(anchor="w", pady=(0, 10))
-        
-        # GitHub link
+
+        # GitHub link (this fork)
         github_frame = ttk.Frame(project_frame)
         github_frame.pack(fill="x", pady=(0, 5))
-        
-        ttk.Label(github_frame, text="GitHub Repository:").pack(side="left")
-        github_button = ttk.Button(github_frame, text="Visit GitHub", 
+
+        ttk.Label(github_frame, text="This Fork (TorranceTech):").pack(side="left")
+        github_button = ttk.Button(github_frame, text="Visit GitHub",
                                   command=lambda: self._open_url(self.github_url))
         github_button.pack(side="right")
+
+        # Upstream / original project link
+        upstream_frame = ttk.Frame(project_frame)
+        upstream_frame.pack(fill="x", pady=(0, 5))
+
+        ttk.Label(upstream_frame, text="Original Project (thad0ctor):").pack(side="left")
+        upstream_button = ttk.Button(upstream_frame, text="Visit GitHub",
+                                    command=lambda: self._open_url(self.upstream_url))
+        upstream_button.pack(side="right")
         
         # Support section
         support_frame = ttk.LabelFrame(content_frame, text="Support the Project", padding=15)
         support_frame.grid(row=row, column=0, sticky="ew", pady=(0, 15))
         row += 1
         
-        support_text = ("If you find this tool useful, consider supporting its development!")
+        support_text = ("If you find this Mac version useful, consider supporting TorranceTech's work!\n"
+                       "You can also support the original project creator (thad0ctor) on their GitHub.")
         support_label = ttk.Label(support_frame, text=support_text, wraplength=400, justify="left")
         support_label.pack(anchor="w", pady=(0, 10))
-        
-        # Donate button
+
+        # Donate button — TorranceTech
         donate_frame = ttk.Frame(support_frame)
-        donate_frame.pack(fill="x")
-        
-        ttk.Label(donate_frame, text="Donate via PayPal:").pack(side="left")
-        donate_button = ttk.Button(donate_frame, text="💝 Donate", 
+        donate_frame.pack(fill="x", pady=(0, 5))
+
+        ttk.Label(donate_frame, text="Support TorranceTech (PayPal):").pack(side="left")
+        donate_button = ttk.Button(donate_frame, text="💝 Donate",
                                   command=lambda: self._open_url(self.donate_url))
         donate_button.pack(side="right")
         
@@ -600,9 +612,11 @@ class AboutTab:
         credits_frame = ttk.LabelFrame(content_frame, text="Credits", padding=15)
         credits_frame.grid(row=row, column=0, sticky="ew")
         
-        credits_text = ("Built with Python and Tkinter\n"
-                       "Designed for use with llama.cpp\n"
-                       "Created by thad0ctor")
+        credits_text = ("Modified by TorranceTech — Apple Silicon (Metal) support for Mac Studio M2/M3/M4\n\n"
+                       "Based on the original llama-server-launcher by thad0ctor\n"
+                       "Original project: github.com/thad0ctor/llama-server-launcher\n\n"
+                       "Built with Python and Tkinter\n"
+                       "Designed for use with llama.cpp")
         credits_label = ttk.Label(credits_frame, text=credits_text, justify="left")
         credits_label.pack(anchor="w")
         

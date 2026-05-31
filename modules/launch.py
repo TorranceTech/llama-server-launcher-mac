@@ -181,6 +181,7 @@ class LaunchManager:
         in; save-script flows leave it off so writing a script never
         executes the binary or hangs the UI on a probe timeout.
         """
+        tensor_split_val = ""  # default; overwritten below after GPU section
         # Get the backend selection and use appropriate directory
         backend = self.launcher.backend_selection.get()
 
@@ -395,23 +396,21 @@ class LaunchManager:
         self.add_arg(cmd, "--temp", self.launcher.temperature.get(), "0.8")
         self.add_arg(cmd, "--min-p", self.launcher.min_p.get(), "0.05")
 
-        # --- Handle GPU arguments: Now ADDING BOTH if set ---
-        tensor_split_val = self.launcher.tensor_split.get().strip()
+        # --- Handle GPU arguments ---
+        is_metal = self.launcher.gpu_info.get("metal", False)
         n_gpu_layers_val = self.launcher.n_gpu_layers.get().strip()
 
-        # Add --tensor-split if the value is non-empty
-        # Use add_arg which handles the non-empty check
-        self.add_arg(cmd, "--tensor-split", tensor_split_val, "") # Add if non-empty string is provided by user
+        # Always read tensor_split_val so it's available for the info message below.
+        tensor_split_val = self.launcher.tensor_split.get().strip()
+        if not is_metal:
+            # --tensor-split and --main-gpu are CUDA/multi-GPU concepts; skip on Metal.
+            self.add_arg(cmd, "--tensor-split", tensor_split_val, "")
 
-        # Add --n-gpu-layers if the value is non-empty AND not the default "0" string
-        # This argument will now be added regardless of the --tensor-split value
         self.add_arg(cmd, "--n-gpu-layers", n_gpu_layers_val, "0")
 
-        # --main-gpu is usually needed when offloading layers (either via --n-gpu-layers or --tensor-split)
-        # It specifies which GPU is considered the "primary" one, often GPU 0.
-        # Llama.cpp default is 0. Include --main-gpu if the user set a non-default value.
-        main_gpu_val = self.launcher.main_gpu.get().strip()
-        self.add_arg(cmd, "--main-gpu", main_gpu_val, "0")
+        if not is_metal:
+            main_gpu_val = self.launcher.main_gpu.get().strip()
+            self.add_arg(cmd, "--main-gpu", main_gpu_val, "0")
 
         # --- Flash Attention ---
         # Both backends require a value after --flash-attn (bare flag errors
@@ -773,6 +772,10 @@ class LaunchManager:
         CUDA0 (= the first main GPU) and OOM against the already-loaded
         main model. See the module-level comment in ``spec_launch.py``.
         """
+        # Metal (Apple Silicon) never uses CUDA_VISIBLE_DEVICES.
+        if self.launcher.gpu_info.get("metal", False):
+            return ("skip", None)
+
         is_manual_mode = self.launcher.gpu_info.get("manual_mode", False)
         device_count = self.launcher.gpu_info.get("device_count", 0)
 
@@ -842,20 +845,18 @@ class LaunchManager:
                     f.write("$ErrorActionPreference = 'Continue'\n\n")
                     f.write('[Console]::OutputEncoding = [System.Text.Encoding]::UTF8 # Set console output encoding to UTF-8\n\n')
 
-                    # --- Set CUDA_DEVICE_ORDER for consistent PCIe bus ordering ---
-                    f.write('# Ensure GPU ordering matches PCIe bus order (consistent with nvidia-smi)\n')
-                    f.write('$env:CUDA_DEVICE_ORDER="PCI_BUS_ID"\n\n')
+                    if not self.launcher.gpu_info.get("metal", False):
+                        # --- Set CUDA_DEVICE_ORDER for consistent PCIe bus ordering ---
+                        f.write('# Ensure GPU ordering matches PCIe bus order (consistent with nvidia-smi)\n')
+                        f.write('$env:CUDA_DEVICE_ORDER="PCI_BUS_ID"\n\n')
 
-                    # --- Add CUDA_VISIBLE_DEVICES action ---
-                    if cuda_action == "export":
-                        f.write(f'Write-Host "Setting CUDA_VISIBLE_DEVICES={cuda_devices_value}" -ForegroundColor DarkCyan\n')
-                        f.write(f'$env:CUDA_VISIBLE_DEVICES="{cuda_devices_value}"\n\n')
-                    elif cuda_action == "unset":
-                         # GPUs detected but none selected, or manual GPU mode —
-                         # either way, clear CUDA_VISIBLE_DEVICES so an inherited
-                         # shell value can't silently re-enable filtered hardware.
-                         f.write('Write-Host "Clearing CUDA_VISIBLE_DEVICES environment variable." -ForegroundColor DarkCyan\n')
-                         f.write('Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue\n\n')
+                        # --- Add CUDA_VISIBLE_DEVICES action ---
+                        if cuda_action == "export":
+                            f.write(f'Write-Host "Setting CUDA_VISIBLE_DEVICES={cuda_devices_value}" -ForegroundColor DarkCyan\n')
+                            f.write(f'$env:CUDA_VISIBLE_DEVICES="{cuda_devices_value}"\n\n')
+                        elif cuda_action == "unset":
+                            f.write('Write-Host "Clearing CUDA_VISIBLE_DEVICES environment variable." -ForegroundColor DarkCyan\n')
+                            f.write('Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue\n\n')
 
                     # --- Add Environmental Variables ---
                     env_vars = self.launcher.env_vars_manager.get_enabled_env_vars()
@@ -955,24 +956,26 @@ class LaunchManager:
                 # Building as a list avoids brittle .replace() surgery on literal
                 # markers that could collide with user-supplied paths.
                 commands = []
+                is_metal = self.launcher.gpu_info.get("metal", False)
 
                 if use_venv:
                     # ``act_script`` was validated above.
                     commands.append(f'source {shlex.quote(str(act_script))}')
                     commands.append('echo "Virtual environment activated."')
 
-                # CUDA_DEVICE_ORDER is always set for consistent PCIe ordering
-                commands.append('export CUDA_DEVICE_ORDER=PCI_BUS_ID')
+                if not is_metal:
+                    # CUDA_DEVICE_ORDER is only meaningful for CUDA backends.
+                    commands.append('export CUDA_DEVICE_ORDER=PCI_BUS_ID')
 
-                if cuda_action == "export":
-                    commands.append(f'export CUDA_VISIBLE_DEVICES={cuda_devices_value}')
-                    commands.append('echo "Setting CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"')
-                elif cuda_action == "unset":
-                    # GPUs detected but none selected, or manual GPU mode —
-                    # either way, clear CUDA_VISIBLE_DEVICES so an inherited
-                    # shell value can't silently re-enable filtered hardware.
-                    commands.append('unset CUDA_VISIBLE_DEVICES')
-                    commands.append('echo "Clearing CUDA_VISIBLE_DEVICES environment variable."')
+                    if cuda_action == "export":
+                        commands.append(f'export CUDA_VISIBLE_DEVICES={cuda_devices_value}')
+                        commands.append('echo "Setting CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"')
+                    elif cuda_action == "unset":
+                        # GPUs detected but none selected, or manual GPU mode —
+                        # either way, clear CUDA_VISIBLE_DEVICES so an inherited
+                        # shell value can't silently re-enable filtered hardware.
+                        commands.append('unset CUDA_VISIBLE_DEVICES')
+                        commands.append('echo "Clearing CUDA_VISIBLE_DEVICES environment variable."')
 
                 env_vars = self.launcher.env_vars_manager.get_enabled_env_vars()
                 if env_vars:
@@ -1016,12 +1019,37 @@ class LaunchManager:
                 )
                 full_script_content = " && ".join(commands) + pause_trailer
 
-                # Attempt to launch in a new terminal window
-                # Use 'bash -c' to execute the command string.
-                # Find common terminal emulators.
-                terminals = ['gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm', 'iterm'] # Add iTerm for macOS
+                # Attempt to launch in a new terminal window.
                 launched = False
-                for term in terminals:
+
+                if sys.platform == "darwin":
+                    # macOS: write to a temp script and open with Terminal.app.
+                    fd, tmp_sh = tempfile.mkstemp(suffix=".sh", prefix="llamacpp_launch_")
+                    os.close(fd)
+                    try:
+                        with open(tmp_sh, "w", encoding="utf-8") as _f:
+                            _f.write("#!/bin/bash\n")
+                            _f.write(full_script_content + "\n")
+                        os.chmod(tmp_sh, stat.S_IRWXU | stat.S_IRGRP | stat.S_IROTH)
+                        # osascript tells Terminal.app to run the script.
+                        applescript = (
+                            f'tell application "Terminal" to do script '
+                            f'"bash {shlex.quote(tmp_sh)}"'
+                        )
+                        subprocess.Popen(["osascript", "-e", applescript])
+                        launched = True
+                        print(f"DEBUG: macOS Terminal.app launch via osascript: {tmp_sh}", file=sys.stderr)
+                    except Exception as mac_err:
+                        print(f"DEBUG: osascript launch failed: {mac_err}; trying open -a Terminal", file=sys.stderr)
+                        try:
+                            subprocess.Popen(["open", "-a", "Terminal", tmp_sh])
+                            launched = True
+                        except Exception as open_err:
+                            print(f"DEBUG: open -a Terminal also failed: {open_err}", file=sys.stderr)
+
+                # Find common terminal emulators (Linux / macOS fallback).
+                terminals = ['gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm', 'iterm']
+                for term in terminals if not launched else []:
                     term_path = shutil.which(term)
                     if term_path:
                         # Use the full path to the terminal executable
@@ -1161,21 +1189,20 @@ class LaunchManager:
                 fh.write("$ErrorActionPreference = 'Continue'\n\n")
                 fh.write('[Console]::OutputEncoding = [System.Text.Encoding]::UTF8 # Set console output encoding to UTF-8\n\n')
 
-                # --- Set CUDA_DEVICE_ORDER for consistent PCIe bus ordering ---
-                fh.write('# Ensure GPU ordering matches PCIe bus order (consistent with nvidia-smi)\n')
-                fh.write('$env:CUDA_DEVICE_ORDER="PCI_BUS_ID"\n\n')
+                is_metal = self.launcher.gpu_info.get("metal", False)
+                if not is_metal:
+                    # --- Set CUDA_DEVICE_ORDER for consistent PCIe bus ordering ---
+                    fh.write('# Ensure GPU ordering matches PCIe bus order (consistent with nvidia-smi)\n')
+                    fh.write('$env:CUDA_DEVICE_ORDER="PCI_BUS_ID"\n\n')
 
-                # --- Add CUDA_VISIBLE_DEVICES action ---
-                cuda_action, cuda_devices_value = self._resolve_cuda_visible_devices_action()
-                if cuda_action == "export":
-                    fh.write(f'Write-Host "Setting CUDA_VISIBLE_DEVICES={cuda_devices_value}" -ForegroundColor DarkCyan\n')
-                    fh.write(f'$env:CUDA_VISIBLE_DEVICES="{cuda_devices_value}"\n\n')
-                elif cuda_action == "unset":
-                     # GPUs detected but none selected, or manual GPU mode —
-                     # either way, clear CUDA_VISIBLE_DEVICES to avoid silently
-                     # filtering real hardware via synthetic/stale indices.
-                     fh.write('Write-Host "Clearing CUDA_VISIBLE_DEVICES environment variable." -ForegroundColor DarkCyan\n')
-                     fh.write('Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue\n\n')
+                    # --- Add CUDA_VISIBLE_DEVICES action ---
+                    cuda_action, cuda_devices_value = self._resolve_cuda_visible_devices_action()
+                    if cuda_action == "export":
+                        fh.write(f'Write-Host "Setting CUDA_VISIBLE_DEVICES={cuda_devices_value}" -ForegroundColor DarkCyan\n')
+                        fh.write(f'$env:CUDA_VISIBLE_DEVICES="{cuda_devices_value}"\n\n')
+                    elif cuda_action == "unset":
+                        fh.write('Write-Host "Clearing CUDA_VISIBLE_DEVICES environment variable." -ForegroundColor DarkCyan\n')
+                        fh.write('Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue\n\n')
 
                 # --- Add Environmental Variables ---
                 env_vars = self.launcher.env_vars_manager.get_enabled_env_vars()
@@ -1302,21 +1329,21 @@ class LaunchManager:
 
                 fh.write("set -e  # Exit on any error\n\n")
 
-                # --- Set CUDA_DEVICE_ORDER for consistent PCIe bus ordering ---
-                fh.write('# Ensure GPU ordering matches PCIe bus order (consistent with nvidia-smi)\n')
-                fh.write('export CUDA_DEVICE_ORDER=PCI_BUS_ID\n\n')
+                is_metal = self.launcher.gpu_info.get("metal", False)
 
-                # --- Add CUDA_VISIBLE_DEVICES action ---
-                cuda_action, cuda_devices_value = self._resolve_cuda_visible_devices_action()
-                if cuda_action == "export":
-                    fh.write(f'echo "Setting CUDA_VISIBLE_DEVICES={cuda_devices_value}"\n')
-                    fh.write(f'export CUDA_VISIBLE_DEVICES="{cuda_devices_value}"\n\n')
-                elif cuda_action == "unset":
-                     # GPUs detected but none selected, or manual GPU mode —
-                     # either way, clear CUDA_VISIBLE_DEVICES to avoid silently
-                     # filtering real hardware via synthetic/stale indices.
-                     fh.write('echo "Clearing CUDA_VISIBLE_DEVICES environment variable."\n')
-                     fh.write('unset CUDA_VISIBLE_DEVICES\n\n')
+                if not is_metal:
+                    # --- Set CUDA_DEVICE_ORDER for consistent PCIe bus ordering ---
+                    fh.write('# Ensure GPU ordering matches PCIe bus order (consistent with nvidia-smi)\n')
+                    fh.write('export CUDA_DEVICE_ORDER=PCI_BUS_ID\n\n')
+
+                    # --- Add CUDA_VISIBLE_DEVICES action ---
+                    cuda_action, cuda_devices_value = self._resolve_cuda_visible_devices_action()
+                    if cuda_action == "export":
+                        fh.write(f'echo "Setting CUDA_VISIBLE_DEVICES={cuda_devices_value}"\n')
+                        fh.write(f'export CUDA_VISIBLE_DEVICES="{cuda_devices_value}"\n\n')
+                    elif cuda_action == "unset":
+                        fh.write('echo "Clearing CUDA_VISIBLE_DEVICES environment variable."\n')
+                        fh.write('unset CUDA_VISIBLE_DEVICES\n\n')
 
                 # --- Add Environmental Variables ---
                 env_vars = self.launcher.env_vars_manager.get_enabled_env_vars()

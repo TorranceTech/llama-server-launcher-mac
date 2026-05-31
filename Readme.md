@@ -1,6 +1,13 @@
-# Llama.cpp (and ik_llama) Server Launcher
+# Llama.cpp Server Launcher — Mac Edition (TorranceTech)
 
 ![Main Menu](images/main.png)
+
+> **This is a modified fork** of [llama-server-launcher](https://github.com/thad0ctor/llama-server-launcher) by [thad0ctor](https://github.com/thad0ctor), with added **Apple Silicon (Metal) support** for Mac Studio M2/M3/M4.
+> All original features and credits belong to thad0ctor. This fork adds Mac-specific functionality.
+
+---
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/torrancetech)
 
 **A user-friendly GUI (Tkinter) to easily configure and launch the `llama.cpp and ik_llama` server, manage model configurations, set environment variables, and generate launch scripts.**
 
@@ -101,14 +108,15 @@ This python script provides a comprehensive graphical interface for `llama.cpp a
 *   **Script Generation:**
     *   Generate ready-to-use PowerShell (`.ps1`) and Bash (`.sh`) scripts from your current settings (including environment variables).
 *   **Cross-Platform Design:**
-    *   Works on Windows (tested), Linux (tested), and macOS (untested).
+    *   Works on Windows (tested), Linux (tested), and macOS Apple Silicon — Mac Studio M2/M3/M4 (tested).
+    *   Apple Silicon: auto-detects Metal GPU and unified memory; skips CUDA-only settings (tensor split, main-GPU, `CUDA_VISIBLE_DEVICES`); launches via Terminal.app.
     *   Includes platform-specific considerations for venv activation (for GPU recognition) and terminal launching.
 *   **Dependency Awareness:**
     *   Checks for optional but recommended dependencies for GPU detection and model information
 
 ## 🆕 Recent Features
 
-*   **May 2026** — MTP / Speculative Decoding tab with full cross-backend support: draft GGUF picker, spec-type-aware default prefill, smart draft GPU controls, and auto `--parallel 1` for MTP. Reasoning / Thinking controls added to the Chat Template tab (`--reasoning`, `--reasoning-format`, `--reasoning-budget`, `--chat-template-kwargs`) plus a `--jinja` toggle.
+*   **May 2026** — Apple Silicon (Metal) support: auto-detects Mac Studio M2/M3/M4, reports unified memory, skips CUDA-only controls, launches via Terminal.app. MTP / Speculative Decoding tab with full cross-backend support: draft GGUF picker, spec-type-aware default prefill, smart draft GPU controls, and auto `--parallel 1` for MTP. Reasoning / Thinking controls added to the Chat Template tab (`--reasoning`, `--reasoning-format`, `--reasoning-budget`, `--chat-template-kwargs`) plus a `--jinja` toggle.
 *   **April 2026** — Settings tab (theme/font controls, Windows high-DPI); user-orderable GPU list and `mmproj` selector dropdown; modular project layout (`modules/`, `config/`, `launchers/`); automated test suite + CI workflow.
 *   **January 2026** — `--fit` (auto-fit context to VRAM) and `--parallel` slot options; improved GGUF parser.
 *   **December 2025** — GPU layer override; Flash Attention updated for newest llama.cpp API; `--cpu-moe` works with ik_llama.
@@ -161,9 +169,32 @@ pip install -r requirements.txt
 ```
 Or follow the [Dependencies](#-dependencies) section above to install dependencies individually.
 
-### 3. Build llama.cpp with CUDA Support
+### 3. Build llama.cpp
 
-You'll need to build `llama.cpp or ik_llama` separately and point the launcher to the build directory. Here's an example build configuration:
+You'll need to build `llama.cpp or ik_llama` separately and point the launcher to the build directory.
+
+#### Apple Silicon (Mac Studio M2 / M3 / M4 — Metal)
+
+> **Metal support is built-in on macOS.** No CUDA, no extra GPU toolkit needed.
+
+```bash
+# Navigate to your llama.cpp directory
+cd /path/to/llama.cpp
+
+# Clean previous builds
+rm -rf build CMakeCache.txt CMakeFiles
+mkdir build && cd build
+
+# Configure with Metal (default on macOS arm64)
+cmake .. -DGGML_METAL=on
+
+# Build with all available cores
+make -j$(sysctl -n hw.logicalcpu)
+```
+
+The launcher auto-detects your Apple Silicon chip and unified memory. GPU offloading is controlled via **N GPU Layers** (`--n-gpu-layers`). Tensor split and main-GPU controls are hidden — they don't apply to Apple Silicon's single unified-memory GPU.
+
+#### Linux / Windows — CUDA
 
 > **⚠️ Example Environment Disclaimer:**  
 > The following build example was tested on **Ubuntu 24.04** with **CUDA 12.9** and **GCC 13**. Your build flags may need adjustment based on your system configuration, CUDA version, GCC version, and GPU architecture.
@@ -191,7 +222,7 @@ make -j$(nproc)
 > **📚 Need More Build Help?**  
 > For additional building guidance, platform-specific instructions, and troubleshooting, refer to the official [llama.cpp documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
 
-**Key Build Flags Explained:**
+**Key CUDA Build Flags Explained:**
 - `-DGGML_CUDA=on` - Enables CUDA support
 - `-DGGML_CUDA_FORCE_MMQ=on` - Forces use of multi-matrix quantization for better performance
 - `-DCMAKE_CUDA_ARCHITECTURES=120` - Targets specific GPU architecture (adjust for your GPU)
@@ -207,3 +238,14 @@ make -j$(nproc)
 ## 🚀 Core Components
 
 This launcher aims to streamline your `llama.cpp` server workflow when working with and testing multiple models while making it more accessible and efficient for both new and experienced users.
+
+---
+
+## Credits
+
+- **Original project:** [llama-server-launcher](https://github.com/thad0ctor/llama-server-launcher) by [thad0ctor](https://github.com/thad0ctor)
+- **Mac Edition fork:** [TorranceTech](https://github.com/TorranceTech) — Apple Silicon (Metal) support for Mac Studio M2/M3/M4
+
+If you find this Mac version useful, consider supporting:
+
+[![Donate via PayPal](https://img.shields.io/badge/Support%20TorranceTech-PayPal-blue.svg)](https://www.paypal.com/paypalme/torrancetech)

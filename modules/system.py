@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -122,6 +123,65 @@ if MISSING_DEPS:
 #  Helper Functions (These remain outside the class as they don't need 'self')
 # ═════════════════════════════════════════════════════════════════════
 
+def is_apple_silicon():
+    """Return True when running on Apple Silicon (arm64 macOS)."""
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def _get_macos_unified_memory_bytes():
+    """Return total unified memory in bytes on Apple Silicon via sysctl."""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    if PSUTIL_AVAILABLE and psutil:
+        try:
+            return psutil.virtual_memory().total
+        except Exception:
+            pass
+    return 0
+
+
+def _get_apple_chip_name():
+    """Return the Apple chip brand string via sysctl."""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "Apple Silicon"
+
+
+def get_gpu_info_metal():
+    """Return gpu_info dict for Apple Silicon Metal backend."""
+    mem_bytes = _get_macos_unified_memory_bytes()
+    chip_name = _get_apple_chip_name()
+    mem_gb = round(mem_bytes / (1024 ** 3), 2) if mem_bytes else 0.0
+    return {
+        "available": True,
+        "metal": True,
+        "device_count": 1,
+        "devices": [{
+            "id": 0,
+            "name": chip_name,
+            "total_memory_bytes": mem_bytes,
+            "total_memory_gb": mem_gb,
+            "compute_capability": "Metal",
+            "multi_processor_count": None,
+        }],
+        "message": f"{chip_name} — {mem_gb:.1f} GB unified memory (Metal)",
+    }
+
+
 def get_gpu_info_with_venv(venv_path=None):
     """Get GPU information using PyTorch, optionally from a virtual environment."""
     if venv_path and Path(venv_path).exists():
@@ -154,11 +214,42 @@ def get_gpu_info_from_venv(venv_path):
         # Fall back to current process detection
         return get_gpu_info_static()
     
-    # Create a small Python script to check for PyTorch/CUDA in the venv
+    # Create a small Python script to check for PyTorch/CUDA (or Metal) in the venv
     detection_script = '''
 import sys
 import os
 import json
+import platform
+import subprocess
+
+# Apple Silicon: detect Metal, skip CUDA entirely
+if sys.platform == "darwin" and platform.machine() == "arm64":
+    try:
+        r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
+        mem_bytes = int(r.stdout.strip()) if r.returncode == 0 else 0
+    except Exception:
+        mem_bytes = 0
+    try:
+        r2 = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True)
+        chip_name = r2.stdout.strip() if r2.returncode == 0 else "Apple Silicon"
+    except Exception:
+        chip_name = "Apple Silicon"
+    mem_gb = round(mem_bytes / (1024**3), 2) if mem_bytes else 0.0
+    print(json.dumps({
+        "available": True,
+        "metal": True,
+        "device_count": 1,
+        "devices": [{
+            "id": 0,
+            "name": chip_name,
+            "total_memory_bytes": mem_bytes,
+            "total_memory_gb": mem_gb,
+            "compute_capability": "Metal",
+            "multi_processor_count": None,
+        }],
+        "message": f"{chip_name} — {mem_gb:.1f} GB unified memory (Metal)",
+    }))
+    sys.exit(0)
 
 # Ensure consistent GPU ordering by PCIe bus ID (matches nvidia-smi and llama.cpp)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -166,7 +257,7 @@ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 try:
     import torch
     torch_available = torch.cuda.is_available()
-    
+
     if torch_available:
         device_count = torch.cuda.device_count()
         gpu_info = {
@@ -174,7 +265,7 @@ try:
             "device_count": device_count,
             "devices": []
         }
-        
+
         for i in range(device_count):
             props = torch.cuda.get_device_properties(i)
             gpu_info["devices"].append({
@@ -185,7 +276,7 @@ try:
                 "compute_capability": f"{props.major}.{props.minor}",
                 "multi_processor_count": props.multi_processor_count
             })
-        
+
         print(json.dumps(gpu_info))
     else:
         print(json.dumps({"available": False, "message": "CUDA not available via PyTorch in venv", "device_count": 0, "devices": []}))
@@ -263,7 +354,10 @@ def _create_fallback_gpu_info(reason):
     return fallback_info
 
 def get_gpu_info_static():
-    """Get GPU information using PyTorch (static method)."""
+    """Get GPU information — Metal on Apple Silicon, CUDA via PyTorch otherwise."""
+    if is_apple_silicon():
+        return get_gpu_info_metal()
+
     if not torch or not TORCH_AVAILABLE:
         msg = "PyTorch not found." if not torch else "CUDA not available via PyTorch."
         return {"available": False, "message": msg, "device_count": 0, "devices": []}
@@ -315,11 +409,23 @@ def format_gpu_mapping_table(gpu_info):
     text and callers can decide whether to print, log, or display.
     """
     is_manual = bool(gpu_info.get("manual_mode"))
+    is_metal = bool(gpu_info.get("metal"))
     devices = list(gpu_info.get("devices") or [])
-    mode_label = "manual GPU mode" if is_manual else "auto-detected (PCI_BUS_ID order)"
+    if is_metal:
+        mode_label = "Apple Silicon Metal"
+    elif is_manual:
+        mode_label = "manual GPU mode"
+    else:
+        mode_label = "auto-detected (PCI_BUS_ID order)"
 
     header = f"===== GPU mapping — {mode_label} ====="
-    if is_manual:
+    if is_metal:
+        footer_msg = (
+            "Apple Silicon unified memory — CUDA_VISIBLE_DEVICES, "
+            "--tensor-split, and --main-gpu are not used. GPU offloading "
+            "is controlled exclusively via --n-gpu-layers."
+        )
+    elif is_manual:
         # Manual indices are synthetic — they're planning placeholders that
         # do NOT map to physical PCIe devices, so the launcher deliberately
         # does NOT emit them as CUDA_VISIBLE_DEVICES (it unsets instead).

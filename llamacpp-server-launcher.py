@@ -207,8 +207,8 @@ class LlamaCppLauncher:
         """
         self.root = root
         self.root.title("LLaMa.cpp Server Launcher")
-        self.root.geometry("900x1000")
-        self.root.minsize(800, 750)
+        self.root.geometry("1150x950")
+        self.root.minsize(1000, 700)
 
         # Worker-thread lifecycle flag: background detection / version-check
         # threads consult this Event before touching any Tk API on

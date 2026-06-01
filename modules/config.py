@@ -797,92 +797,49 @@ class ConfigManager:
             messagebox.showerror("Import Error", f"Failed to import configurations:\n{str(e)}")
 
     def get_config_path(self):
-        """Get the configuration file path, with fallback handling."""
-        # When running from a PyInstaller bundle, the bundle dir is read-only
-        # on reinstall and gets wiped on update. Always use the user config dir.
-        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            user_dir = Path.home() / ".config" / "llama_cpp_launcher"
-            user_dir.mkdir(parents=True, exist_ok=True)
-            user_config = user_dir / "configs.json"
-            # Seed with bundled defaults (correct model_dirs) on first launch
-            if not user_config.exists():
-                bundled = Path(sys._MEIPASS) / "config" / "llama_cpp_launcher_configs.json"
-                if bundled.exists():
-                    try:
-                        import shutil as _sh
-                        _sh.copy2(bundled, user_config)
-                        print(f"INFO: Seeded user config from bundle: {user_config}", file=sys.stderr)
-                    except OSError as _e:
-                        print(f"WARNING: Could not seed user config: {_e}", file=sys.stderr)
-            print(f"DEBUG: Using bundle user config: {user_config}", file=sys.stderr)
-            return user_config
+        """Get the configuration file path.
 
-        repo_root = Path(__file__).parent.parent
-        local_path = repo_root / "config" / "llama_cpp_launcher_configs.json" # Renamed slightly to avoid potential clashes
-        legacy_path = repo_root / "llama_cpp_launcher_configs.json"
-        # Migrate pre-reorg config from repo root into config/ on first run after upgrade.
-        if legacy_path.exists() and legacy_path.is_file() and legacy_path.stat().st_size > 0:
-            if not local_path.exists() or local_path.stat().st_size == 0:
-                try:
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-                    # Preserve a recoverable copy of the pre-migration file so a mid-migration
-                    # failure or an unexpected later wipe still has a restore point on disk.
-                    migration_backup = legacy_path.with_name(legacy_path.name + ".premigration_backup")
-                    try:
-                        shutil.copy2(legacy_path, migration_backup)
-                        print(f"INFO: Migration backup saved to {migration_backup}", file=sys.stderr)
-                    except OSError as backup_err:
-                        print(f"WARNING: Could not create migration backup at {migration_backup}: {backup_err}", file=sys.stderr)
-                    legacy_path.replace(local_path)
-                    print(f"INFO: Migrated config from {legacy_path} to {local_path}", file=sys.stderr)
-                except OSError as e:
-                    print(f"WARNING: Could not migrate legacy config at {legacy_path}: {e}", file=sys.stderr)
-        print(f"DEBUG: Checking local config path FULL PATH: {local_path.resolve()}", file=sys.stderr)
-        print(f"DEBUG: Current working directory: {Path.cwd()}", file=sys.stderr)
+        Always uses ~/.config/llama_cpp_launcher/configs.json so that the
+        Python script and the .app bundle share one config file.  On the
+        first run after an upgrade from the old layout, the local
+        config/llama_cpp_launcher_configs.json is migrated automatically.
+        """
+        user_dir = Path.home() / ".config" / "llama_cpp_launcher"
         try:
-            local_dir = local_path.parent
-            local_dir.mkdir(parents=True, exist_ok=True)
+            user_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"WARNING: Could not create config dir {user_dir}: {e}", file=sys.stderr)
 
-            # Check if a config file exists and is empty (possibly from a failed previous run)
-            # If empty, we can safely delete it and use the local path.
-            if local_path.exists() and local_path.stat().st_size == 0:
-                 try: local_path.unlink()
-                 except OSError: pass # Ignore if delete fails
+        user_config = user_dir / "configs.json"
 
-            # Check write permissions AFTER cleanup attempt
-            if os.access(local_dir, os.W_OK):
-                 print(f"DEBUG: Using local config path FULL PATH: {local_path.resolve()}", file=sys.stderr)
-                 return local_path
-            else:
-                 raise PermissionError(f"No write access to config directory: {local_dir}") # Force fallback
+        # One-time migration: if user_config doesn't exist yet, pull from the
+        # old local path (repo config/ dir) or from the PyInstaller bundle.
+        if not user_config.exists() or user_config.stat().st_size == 0:
+            if user_config.exists():
+                try: user_config.unlink()
+                except OSError: pass
 
+            # Candidate sources in priority order
+            candidates = []
+            repo_root = Path(__file__).parent.parent
+            candidates.append(repo_root / "config" / "llama_cpp_launcher_configs.json")
+            candidates.append(repo_root / "llama_cpp_launcher_configs.json")
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                candidates.append(Path(sys._MEIPASS) / "config" / "llama_cpp_launcher_configs.json")
 
-        except (OSError, PermissionError, IOError) as e:
-            print(f"Warning: Could not use local config path due to permissions/IO issue: {e}", file=sys.stderr)
-            # Fallback to user config directory. Wrap the Path.home() /
-            # APPDATA resolution in the same try/except as the mkdir below
-            # so a fully-broken environment (no HOME, no APPDATA) still
-            # returns a sensible null-device sentinel instead of crashing.
-            fallback_dir = None
-            try:
-                if sys.platform == "win32":
-                    appdata = os.getenv("APPDATA")
-                    fallback_dir = Path(appdata) / "LlamaCppLauncher" if appdata else Path.home() / ".llama_cpp_launcher"
-                else:  # Linux, macOS, etc.
-                    fallback_dir = Path.home() / ".config" / "llama_cpp_launcher"
-                fallback_dir.mkdir(parents=True, exist_ok=True)
-                fallback_path = fallback_dir / "configs.json"
-                # Check if fallback path exists and is empty, clean it up if so
-                if fallback_path.exists() and fallback_path.stat().st_size == 0:
-                     try: fallback_path.unlink()
-                     except OSError: pass
-                print(f"DEBUG: Using fallback config path FULL PATH: {fallback_path.resolve()}", file=sys.stderr)
-                return fallback_path
-            except Exception as e_fallback:
-                 print(f"CRITICAL ERROR: Could not use local config path or fallback config path {fallback_dir}. Configuration saving/loading is disabled. Error: {e_fallback}", file=sys.stderr)
-                 messagebox.showerror("Config Error", f"Failed to set up configuration directory.\nSaving/loading configurations is disabled.\nError: {e_fallback}")
-                 # Return a dummy non-existent path to prevent errors later
-                 return Path("/dev/null") if sys.platform != "win32" else Path("NUL") # Use platform-appropriate null device
+            for src in candidates:
+                if src.exists() and src.stat().st_size > 0:
+                    try:
+                        shutil.copy2(src, user_config)
+                        print(f"INFO: Migrated config from {src} → {user_config}", file=sys.stderr)
+                    except OSError as _e:
+                        print(f"WARNING: Could not migrate config: {_e}", file=sys.stderr)
+                    break
+
+        print(f"DEBUG: Using config: {user_config}", file=sys.stderr)
+        print(f"DEBUG: Current working directory: {Path.cwd()}", file=sys.stderr)
+
+        return user_config
 
     def load_saved_configs(self):
         """Load saved configurations from file."""

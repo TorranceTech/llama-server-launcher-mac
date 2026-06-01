@@ -2213,6 +2213,18 @@ class LlamaCppLauncher:
                 p_str = str(p)
                 print(f"DEBUG: Adding model directory - Original: '{directory}', Resolved: '{p_str}'", file=sys.stderr)
 
+                # Warn about overly broad directories that would cause very slow scans
+                _home = Path.home().resolve()
+                _broad_dirs = {Path("/").resolve(), Path("/Users").resolve(), _home}
+                if p in _broad_dirs:
+                    if not messagebox.askyesno(
+                        "Broad Directory Warning",
+                        f"'{p}' is a very broad directory and may contain millions of files.\n"
+                        "Scanning it could take a very long time or freeze the app.\n\n"
+                        "Are you sure you want to add it?"
+                    ):
+                        return
+
                 if p_str not in [str(x) for x in self.model_dirs]: # Compare resolved paths
                     self.model_dirs.append(p) # Store as Path object
                     self._update_model_dirs_listbox()
@@ -2336,11 +2348,27 @@ class LlamaCppLauncher:
         re_first1 = re.compile(r"^(.*?)-0*1-of-\d+\.gguf$", re.I)
         re_first2 = re.compile(r"^(.*?)\.gguf\.part0*1of\d+$", re.I)
 
+        # Directories that are too broad to scan safely
+        _home = Path.home().resolve()
+        _blocked_scan_dirs = {Path("/").resolve(), Path("/Users").resolve(), _home}
+
         # Two-pass approach to handle multi-part files correctly
         all_gguf_files = []
         for model_dir in self.model_dirs:
             # Skip invalid or non-existent directories silently during scan
             if not isinstance(model_dir, Path) or not model_dir.is_dir(): continue
+            try:
+                resolved_dir = model_dir.resolve()
+            except Exception:
+                resolved_dir = model_dir
+            if resolved_dir in _blocked_scan_dirs:
+                print(f"WARNING: Skipping overly broad directory '{model_dir}' — would scan entire filesystem.", file=sys.stderr)
+                self.root.after(0, lambda d=str(model_dir): messagebox.showwarning(
+                    "Broad Directory Skipped",
+                    f"'{d}' is too broad to scan safely and was skipped.\n"
+                    "Please add a more specific models folder instead."
+                ))
+                continue
             print(f"DEBUG: Scanning directory: {model_dir}", file=sys.stderr)
             try:
                 # Collect GGUF model files with case-insensitive matching, including *.gguf.partXofY.

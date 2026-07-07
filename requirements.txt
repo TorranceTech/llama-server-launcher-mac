@@ -3,4 +3,4 @@ requests>=2.31.0  # Used in about_tab.py for version checking
 
 # Optional but recommended dependencies
 torch>=2.0.0      # Required for GPU detection and selection
-psutil>=5.9.0     # Optional for enhanced system information
+psutil>=7.2.2     # Optional for enhanced system information
